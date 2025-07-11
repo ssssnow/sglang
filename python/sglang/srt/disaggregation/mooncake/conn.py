@@ -198,9 +198,10 @@ class MooncakeKVManager(BaseKVManager):
                 get_int_env_var("SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE", 2), 1
             )
             self.start_decode_thread()
-            self.connection_pool: Dict[str, Dict[str, Union[str, int]]] = {}
+            self.connection_pool: Dict[str, List[List[Dict[str, int]]]] = {}
             self.prefill_tp_size_table: Dict[str, int] = {}
             self.prefill_dp_size_table: Dict[str, int] = {}
+            self.prefill_pp_size_table: Dict[str, int] = {}
         else:
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
@@ -240,10 +241,14 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
+        # only support decode pp_size == 1 for now
+        assert self.kv_args.prefill_start_layer+num_layers <= len(dst_kv_ptrs), (
+            f"prefill_start_layer: {self.kv_args.prefill_start_layer}, num_layers: {num_layers}, len(dst_kv_ptrs): {len(dst_kv_ptrs)}"
+        )
         layers_params = [
             (
                 self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id],
+                dst_kv_ptrs[layer_id + self.kv_args.prefill_start_layer],
                 self.kv_args.kv_item_lens[layer_id],
             )
             for layer_id in range(num_layers)
@@ -618,7 +623,9 @@ class MooncakeKVManager(BaseKVManager):
             "dp_size": self.dp_size,
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
+            "prefill_pp_size": self.kv_args.prefill_pp_size,
             "engine_rank": self.kv_args.engine_rank,
+            "prefill_pp_rank": self.kv_args.prefill_pp_rank,
         }
 
         try:
@@ -777,10 +784,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.data_parallel_rank = data_parallel_rank
 
         if self.bootstrap_addr not in self.kv_mgr.prefill_dp_size_table:
-            self.prefill_tp_size, self.prefill_dp_size = (
+            self.prefill_tp_size, self.prefill_dp_size, self.prefill_pp_size = (
                 self._get_prefill_parallel_info_from_server()
             )
-            if self.prefill_tp_size is None or self.prefill_dp_size is None:
+            if self.prefill_tp_size is None or self.prefill_dp_size is None or self.prefill_pp_size is None:
                 self.kv_mgr.record_failure(
                     self.bootstrap_room,
                     f"Could not fetch prefill parallel info from bootstrap_addr: {self.bootstrap_addr}",
@@ -789,7 +796,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 return
             else:
                 logger.debug(
-                    f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_tp_size}"
+                    f"Fetch prefill parallel info from [{self.bootstrap_addr}]: DP size:{self.prefill_dp_size}, TP size:{self.prefill_tp_size}, Prefill PP size:{self.prefill_pp_size}"
                 )
                 self.kv_mgr.prefill_tp_size_table[self.bootstrap_addr] = (
                     self.prefill_tp_size
@@ -797,11 +804,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.prefill_dp_size_table[self.bootstrap_addr] = (
                     self.prefill_dp_size
                 )
+                self.kv_mgr.prefill_pp_size_table[self.bootstrap_addr] = (
+                    self.prefill_pp_size
+                )
         else:
             self.prefill_tp_size = self.kv_mgr.prefill_tp_size_table[
                 self.bootstrap_addr
             ]
             self.prefill_dp_size = self.kv_mgr.prefill_dp_size_table[
+                self.bootstrap_addr
+            ]
+            self.prefill_pp_size = self.kv_mgr.prefill_pp_size_table[
                 self.bootstrap_addr
             ]
 
@@ -861,28 +874,31 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
-            for target_tp_rank in self.target_tp_ranks:
-                bootstrap_info = self._get_bootstrap_info_from_server(
-                    target_tp_rank,
-                    self.target_dp_group,
-                )
-                if bootstrap_info is not None:
-                    # NOTE: only support MLA for now: select one prefill rank as real rank
-                    bootstrap_info["is_dummy"] = not bool(
-                        target_tp_rank == self.target_tp_rank
-                        or self.target_tp_rank is None
+            for prefill_pp_rank in range(self.prefill_pp_size):
+                bootstrap_infos.append([])
+                for target_tp_rank in self.target_tp_ranks:
+                    bootstrap_info = self._get_bootstrap_info_from_server(
+                        target_tp_rank,
+                        prefill_pp_rank,
+                        self.target_dp_group,
                     )
-                    logger.debug(
-                        f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
-                    )
-                    bootstrap_infos.append(bootstrap_info)
-                else:
-                    self.kv_mgr.record_failure(
-                        self.bootstrap_room,
-                        f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}",
-                    )
-                    self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                    return
+                    if bootstrap_info is not None:
+                        # NOTE: only support MLA for now: select one prefill rank as real rank
+                        bootstrap_info["is_dummy"] = not bool(
+                            target_tp_rank == self.target_tp_rank
+                            or self.target_tp_rank is None
+                        )
+                        logger.debug(
+                            f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
+                        )
+                        bootstrap_infos[prefill_pp_rank].append(bootstrap_info)
+                    else:
+                        self.kv_mgr.record_failure(
+                            self.bootstrap_room,
+                            f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}, prefill_pp_rank: {prefill_pp_rank}",
+                        )
+                        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                        return
 
             self.bootstrap_infos = bootstrap_infos
             self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
@@ -896,10 +912,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(self.bootstrap_room)
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.WaitingForInput)
 
-    def _get_bootstrap_info_from_server(self, engine_rank, target_dp_group):
+    def _get_bootstrap_info_from_server(self, engine_rank, prefill_pp_rank, target_dp_group):
         """Fetch the bootstrap info from the bootstrap server."""
         try:
-            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}"
+            url = f"http://{self.bootstrap_addr}/route?engine_rank={engine_rank}&target_dp_group={target_dp_group}&prefill_pp_rank={prefill_pp_rank}"
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 bootstrap_info = response.json()
@@ -922,7 +938,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 prefill_parallel_info = response.json()
                 return int(prefill_parallel_info["prefill_tp_size"]), int(
                     prefill_parallel_info["prefill_dp_size"]
-                )
+                ), int(prefill_parallel_info["prefill_pp_size"])
             else:
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
@@ -933,29 +949,30 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return None, None
 
     def _register_kv_args(self):
-        for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-
-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                    ]
+        for bootstrap_info_list in self.bootstrap_infos:
+            for bootstrap_info in bootstrap_info_list:
+                self.prefill_server_url = (
+                    f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
                 )
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+                )
+                packed_aux_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+                )
+
+                sock, lock = self._connect("tcp://" + self.prefill_server_url)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                        ]
+                    )
 
     @classmethod
     def _connect(cls, endpoint: str):
@@ -968,25 +985,26 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        for bootstrap_info in self.bootstrap_infos:
-            self.prefill_server_url = (
-                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
-            )
-            is_dummy = bootstrap_info["is_dummy"]
-
-            sock, lock = self._connect("tcp://" + self.prefill_server_url)
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        str(self.required_dst_info_num).encode("ascii"),
-                    ]
+        for prefill_pp_rank in range(self.prefill_pp_size):
+            for bootstrap_info in self.bootstrap_infos[prefill_pp_rank]:
+                self.prefill_server_url = (
+                    f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
                 )
+                is_dummy = bootstrap_info["is_dummy"]
+
+                sock, lock = self._connect("tcp://" + self.prefill_server_url)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii") if not is_dummy else b"",
+                            str(self.required_dst_info_num).encode("ascii"),
+                        ]
+                    )
 
     def poll(self) -> KVPoll:
         if self.conclude_state is None:
@@ -1025,8 +1043,10 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         self._setup_routes()
         self.tp_size = None
         self.dp_size = None
+        self.prefill_pp_size = None
         self.tp_size_per_dp_rank = None
-        self.prefill_port_table: Dict[int, Dict[int, Dict[str, Union[str, int]]]] = {}
+        # key: dp_group, value: Dict[prefill_pp_rank, Dict[tp_rank, Dict[str, Union[str, int]]]]
+        self.prefill_port_table: Dict[int, Dict[int, Dict[int, Dict[str, Union[str, int]]]]] = {}
 
         # Start bootstrap server
         self.thread = threading.Thread(target=self._run_server, daemon=True)
@@ -1058,15 +1078,20 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         role = data["role"]
         tp_size = data["tp_size"]
         dp_size = data["dp_size"]
+        pp_size = int(data["pp_size"])
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
+        prefill_pp_rank = int(data["prefill_pp_rank"])
 
         if self.tp_size is None:
             self.tp_size = tp_size
 
         if self.dp_size is None:
             self.dp_size = dp_size
+        
+        if self.prefill_pp_size is None:
+            self.prefill_pp_size = pp_size
 
         tp_size_per_dp_rank = tp_size // dp_size
         if self.tp_size_per_dp_rank is None:
@@ -1080,8 +1105,10 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             async with self.lock:
                 if dp_group not in self.prefill_port_table:
                     self.prefill_port_table[dp_group] = {}
+                if prefill_pp_rank not in self.prefill_port_table[dp_group]:
+                    self.prefill_port_table[dp_group][prefill_pp_rank] = {}
 
-            self.prefill_port_table[dp_group][tp_rank_in_dp_group] = {
+            self.prefill_port_table[dp_group][prefill_pp_rank][tp_rank_in_dp_group] = {
                 "rank_ip": rank_ip,
                 "rank_port": rank_port,
             }
@@ -1102,14 +1129,14 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             prefill_parallel_info = {
                 "prefill_tp_size": self.tp_size,
                 "prefill_dp_size": self.dp_size,
+                "prefill_pp_size": self.prefill_pp_size,
             }
             return web.json_response(prefill_parallel_info, status=200)
 
         # Find corresponding prefill info
+        prefill_pp_rank = request.query.get("prefill_pp_rank")
         async with self.lock:
-            bootstrap_info = self.prefill_port_table[int(target_dp_group)][
-                int(engine_rank)
-            ]
+            bootstrap_info = self.prefill_port_table[int(target_dp_group)][int(prefill_pp_rank)][int(engine_rank)]
 
         if bootstrap_info is not None:
             return web.json_response(bootstrap_info, status=200)
