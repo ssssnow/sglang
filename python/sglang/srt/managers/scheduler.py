@@ -109,6 +109,7 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.mm_utils import init_embedding_cache
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
+    GenerationBatchResult,
     MultimodalInputs,
     Req,
     ScheduleBatch,
@@ -165,15 +166,15 @@ RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
 
-@dataclass
-class GenerationBatchResult:
-    logits_output: Optional[LogitsProcessorOutput]
-    pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
-    next_token_ids: Optional[List[int]]
-    extend_input_len_per_req: List[int]
-    extend_logprob_start_len_per_req: List[int]
-    bid: int
-    can_run_cuda_graph: bool
+# @dataclass
+# class GenerationBatchResult:
+#     logits_output: Optional[LogitsProcessorOutput]
+#     pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+#     next_token_ids: Optional[List[int]]
+#     extend_input_len_per_req: List[int]
+#     extend_logprob_start_len_per_req: List[int]
+#     bid: int
+#     can_run_cuda_graph: bool
 
 
 @dataclass
@@ -2646,7 +2647,9 @@ def run_scheduler_process(
             else:
                 scheduler.event_loop_normal()
         elif disaggregation_mode == DisaggregationMode.PREFILL:
-            if scheduler.enable_overlap:
+            if server_args.pp_size > 1:
+                scheduler.event_loop_normal_pp_disagg_prefill()
+            elif scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_prefill()
             else:
                 scheduler.event_loop_normal_disagg_prefill()

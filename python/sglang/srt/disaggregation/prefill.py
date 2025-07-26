@@ -20,10 +20,11 @@ Life cycle of a request in the prefill server
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from collections import deque
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict
 
 import torch
 
@@ -43,14 +44,14 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req, ScheduleBatch, GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.utils import require_mlp_sync, point_to_point_pyobj
 
 if TYPE_CHECKING:
     from torch.distributed import ProcessGroup
 
-    from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+    from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -308,19 +309,27 @@ class SchedulerDisaggregationPrefillMixin:
         ]
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
+        unsend_reqs: Dict[str, Req] = {}
 
         while True:
+            server_is_idle = True
             for mb_id in range(self.pp_size):
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
                 recv_reqs = self.recv_requests()
+                if recv_reqs is not None and len(recv_reqs) > 0:
+                    for req in recv_reqs:
+                        if hasattr(req, "rid"):
+                            unsend_reqs[req.rid] = req
                 self.process_input_requests(recv_reqs)
                 self.waiting_queue.extend(
                     self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
                 )
-                self.process_prefill_chunk()
-                mbs[mb_id] = self.get_next_batch_to_prefill()
+                if len(self.waiting_queue) > 0 and self.attn_tp_rank == 0:
+                    logger.info(f"Waiting queue len: {len(self.waiting_queue)}")
+                self.process_pp_prefill_chunk()
+                mbs[mb_id] = self.get_new_batch_prefill()
                 self.running_mbs[mb_id] = self.running_batch
 
                 if require_mlp_sync(self.server_args):
@@ -328,8 +337,8 @@ class SchedulerDisaggregationPrefillMixin:
                 self.cur_batch = mbs[mb_id]
 
                 if self.cur_batch:
+                    server_is_idle = False
                     result = self.run_batch(self.cur_batch)
-                    # self.process_batch_result_disagg_prefill(self.cur_batch, result)
                 
                 if len(self.disagg_prefill_inflight_queue) > 0:
                     self.process_disagg_prefill_inflight_queue()
@@ -368,7 +377,7 @@ class SchedulerDisaggregationPrefillMixin:
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-
+                
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
@@ -416,11 +425,17 @@ class SchedulerDisaggregationPrefillMixin:
                             all_gather_group=self.attn_tp_group,
                         )
 
-                    # send out reqs to the next stage
-                    dp_offset = self.attn_dp_rank * self.attn_tp_size
                     if self.attn_tp_rank == 0:
+                        tobe_sent_reqs = []
+                        if mbs[mb_id] is not None:
+                            for req in mbs[mb_id].reqs:
+                                if req.rid in unsend_reqs:
+                                    tobe_sent_reqs.append(unsend_reqs[req.rid])
+                                    unsend_reqs.pop(req.rid)
+                        # send out reqs to the next stage
+                        dp_offset = self.attn_dp_rank * self.attn_tp_size
                         point_to_point_pyobj(
-                            recv_reqs,
+                            tobe_sent_reqs,
                             self.pp_rank * self.tp_size + dp_offset,
                             self.world_group.cpu_group,
                             self.pp_rank * self.tp_size + dp_offset,
@@ -433,15 +448,14 @@ class SchedulerDisaggregationPrefillMixin:
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-
                 pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
-            if self.cur_batch is None and len(self.disagg_prefill_inflight_queue) == 0:
+            # check if member of mbs is all None
+            if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
                 self.check_memory()
                 self.new_token_ratio = self.init_new_token_ratio
                 self.maybe_sleep_on_idle()
-
             self.running_batch.batch_is_full = False
 
     @torch.no_grad()
@@ -545,17 +559,18 @@ class SchedulerDisaggregationPrefillMixin:
                 req.output_ids.append(next_token_id)
                 self.tree_cache.cache_unfinished_req(req)  # update the tree and lock
                 self.disagg_prefill_inflight_queue.append(req)
-                if logits_output.hidden_states is not None:
-                    last_hidden_index = (
-                        hidden_state_offset + extend_input_len_per_req[i] - 1
-                    )
-                    req.hidden_states_tensor = (
-                        logits_output.hidden_states[last_hidden_index].cpu().clone()
-                    )
-                    hidden_state_offset += extend_input_len_per_req[i]
-                else:
-                    req.hidden_states_tensor = None
+                # if logist_output is not None and logits_output.hidden_states is not None:
+                #     last_hidden_index = (
+                #         hidden_state_offset + extend_input_len_per_req[i] - 1
+                #     )
+                #     req.hidden_states_tensor = (
+                #         logits_output.hidden_states[last_hidden_index].cpu().clone()
+                #     )
+                #     hidden_state_offset += extend_input_len_per_req[i]
+                # else:
+                #     req.hidden_states_tensor = None
                 if req.return_logprob:
+                    logger.info(f"return logprob is true")
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None
                     extend_logprob_start_len = extend_logprob_start_len_per_req[i]
@@ -703,6 +718,39 @@ class SchedulerDisaggregationPrefillMixin:
                 # chunked request keeps its rid but will get a new req_pool_idx
                 self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
                 self.running_batch.batch_is_full = False
+    
+    def process_pp_prefill_chunk(self: Scheduler) -> None:
+        # Merge the prefill batch into the running batch
+        chunked_req_to_exclude = set()
+        if self.chunked_req:
+            # Move the chunked request out of the batch so that we can merge
+            # only finished requests to running_batch.
+            chunked_req_to_exclude.add(self.chunked_req)
+            self.tree_cache.cache_unfinished_req(self.chunked_req)
+            if self.enable_overlap:
+                # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
+                self.chunked_req.tmp_end_idx = min(
+                    len(self.chunked_req.fill_ids),
+                    len(self.chunked_req.origin_input_ids),
+                )
+            else:
+                logger.info(f"send kv chunk 3")
+                self.send_kv_chunk(self.chunked_req)
+            # chunked request keeps its rid but will get a new req_pool_idx
+            self.req_to_token_pool.free(self.chunked_req.req_pool_idx)
+
+        if self.last_batch and self.last_batch.forward_mode.is_extend():
+            if self.last_batch.chunked_req is not None:
+                chunked_req_to_exclude.add(self.last_batch.chunked_req)
+
+            # Filter batch
+            last_bs = self.last_batch.batch_size()
+            self.last_batch.filter_batch(
+                chunked_req_to_exclude=list(chunked_req_to_exclude)
+            )
+            if self.last_batch.batch_size() < last_bs:
+                self.running_batch.batch_is_full = False
+            # there should not be running batch for pd disaggregation
 
     def send_kv_chunk(
         self: Scheduler,

@@ -267,15 +267,47 @@ class MooncakeKVManager(BaseKVManager):
                 if status != 0:
                     return status
             return 0
+        
+        def process_all_layers(layers_params)-> int:
+            src_addr_list = []
+            dst_addr_list = []
+            length_list = []
+            total_length = 0
+            counter = 0
+            max_length = 0
+            for src_ptr, dst_ptr, item_len in layers_params:
+                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    total_length += length
+                    counter += 1
+                    max_length = max(max_length, length)
+                    src_addr_list.append(src_addr)
+                    dst_addr_list.append(dst_addr)
+                    length_list.append(length)
 
+            status = self.engine.batch_transfer_sync(
+                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+            )
+            if status != 0:
+                return status
+            return 0
+
+        # futures = [
+        #     executor.submit(
+        #         process_layer,
+        #         src_ptr,
+        #         dst_ptr,
+        #         item_len,
+        #     )
+        #     for (src_ptr, dst_ptr, item_len) in layers_params
+        # ]
         futures = [
             executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
+                process_all_layers,
+                layers_params,
             )
-            for (src_ptr, dst_ptr, item_len) in layers_params
         ]
 
         for future in concurrent.futures.as_completed(futures):
@@ -390,28 +422,34 @@ class MooncakeKVManager(BaseKVManager):
                             break
 
                         if kv_chunk.is_last:
-                            # Only the last chunk we need to send the aux data
-                            ret = self.send_aux(
-                                req.mooncake_session_id,
-                                kv_chunk.prefill_aux_index,
-                                self.decode_kv_args_table[
-                                    req.mooncake_session_id
-                                ].dst_aux_ptrs,
-                                req.dst_aux_index,
-                            )
-                            polls.append(True if ret == 0 else False)
+                            if self.kv_args.prefill_pp_rank == (self.kv_args.prefill_pp_size-1):
+                                # Only the last chunk we need to send the aux data
+                                ret = self.send_aux(
+                                    req.mooncake_session_id,
+                                    kv_chunk.prefill_aux_index,
+                                    self.decode_kv_args_table[
+                                        req.mooncake_session_id
+                                    ].dst_aux_ptrs,
+                                    req.dst_aux_index,
+                                )
+                                polls.append(True if ret == 0 else False)
+                            else:
+                                self.update_status(req.room, KVPoll.Success)
+                                polls.append(True)
+
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
 
                             # Only sync status when all the dst ranks have received the kvcache
-                            if len(polls) == req.required_dst_info_num:
-                                status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                self.update_status(req.room, status)
-                                for endpoint, dst_port, room in dst_ranks_infos:
-                                    self.sync_status_to_decode_endpoint(
-                                        endpoint, dst_port, room, status
-                                    )
+                            if self.kv_args.prefill_pp_rank == (self.kv_args.prefill_pp_size-1):
+                                if len(polls) == req.required_dst_info_num:
+                                    status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                    self.update_status(req.room, status)
+                                    for endpoint, dst_port, room in dst_ranks_infos:
+                                        self.sync_status_to_decode_endpoint(
+                                            endpoint, dst_port, room, status
+                                        )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint
@@ -943,10 +981,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 logger.error(
                     f"Failed to get prefill parallel info: {response.status_code}, {response.text}"
                 )
-                return None, None
+                return None, None, None
         except Exception as e:
             logger.error(f"Error fetching prefill parallel info from bootstrap: {e}")
-            return None, None
+            return None, None, None
 
     def _register_kv_args(self):
         for bootstrap_info_list in self.bootstrap_infos:
@@ -1078,7 +1116,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
         role = data["role"]
         tp_size = data["tp_size"]
         dp_size = data["dp_size"]
-        pp_size = int(data["pp_size"])
+        prefill_pp_size = int(data["prefill_pp_size"])
         rank_ip = data["rank_ip"]
         rank_port = int(data["rank_port"])
         engine_rank = int(data["engine_rank"])
@@ -1091,7 +1129,7 @@ class MooncakeKVBootstrapServer(BaseKVBootstrapServer):
             self.dp_size = dp_size
         
         if self.prefill_pp_size is None:
-            self.prefill_pp_size = pp_size
+            self.prefill_pp_size = prefill_pp_size
 
         tp_size_per_dp_rank = tp_size // dp_size
         if self.tp_size_per_dp_rank is None:

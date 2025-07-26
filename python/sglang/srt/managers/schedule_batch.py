@@ -36,6 +36,7 @@ import dataclasses
 import hashlib
 import logging
 import threading
+from dataclasses import dataclass
 from enum import Enum, auto
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Set, Tuple, Union
@@ -66,6 +67,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import flatten_nested_list, support_triton
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.speculative.eagle_utils import EagleDraftInput, EagleVerifyInput
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -109,6 +111,16 @@ global_server_args_dict = {k: getattr(ServerArgs, k) for k in GLOBAL_SERVER_ARGS
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class GenerationBatchResult:
+    logits_output: Optional[LogitsProcessorOutput]
+    pp_hidden_states_proxy_tensors: Optional[torch.Tensor]
+    next_token_ids: Optional[List[int]]
+    extend_input_len_per_req: List[int]
+    extend_logprob_start_len_per_req: List[int]
+    bid: int
+    can_run_cuda_graph: bool
 
 class BaseFinishReason:
     def __init__(self, is_error: bool = False):

@@ -1,7 +1,7 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,18 @@ class MooncakeTransferEngine:
                 peer_buffer_address,
             )
 
+        return ret
+    
+    def batch_transfer_sync(
+        self, session_id: str, buffers: List[int], peer_buffer_addresses: List[int], lengths: List[int]
+    ) -> int:
+        """Synchronously transfer data to the specified address."""
+        ret = self.engine.batch_transfer_sync_write(
+            session_id, buffers, peer_buffer_addresses, lengths
+        )
+        if ret < 0:
+            logger.error("Mooncake Transfer Engine Return Error.")
+            raise RuntimeError("Mooncake Transfer Engine Return Error.")
         return ret
 
     def get_session_id(self):
