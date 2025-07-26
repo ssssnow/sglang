@@ -912,16 +912,43 @@ class MooncakeKVReceiver(BaseKVReceiver):
 
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
-            for prefill_pp_rank in range(self.prefill_pp_size):
+            if self.kv_mgr.kv_args.decode_pp_size == 1:
+                # decode do not use pp
+                for prefill_pp_rank in range(self.prefill_pp_size):
+                    bootstrap_infos.append([])
+                    for target_tp_rank in self.target_tp_ranks:
+                        bootstrap_info = self._get_bootstrap_info_from_server(
+                            target_tp_rank,
+                            prefill_pp_rank,
+                            self.target_dp_group,
+                        )
+                        if bootstrap_info is not None:
+                            # NOTE: only support MLA for now: select one prefill rank as real rank
+                            bootstrap_info["is_dummy"] = not bool(
+                                target_tp_rank == self.target_tp_rank
+                                or self.target_tp_rank is None
+                            )
+                            logger.debug(
+                                f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
+                            )
+                            bootstrap_infos[prefill_pp_rank].append(bootstrap_info)
+                        else:
+                            self.kv_mgr.record_failure(
+                                self.bootstrap_room,
+                                f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}, prefill_pp_rank: {prefill_pp_rank}",
+                            )
+                            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+                            return
+            else:
+                assert self.kv_mgr.kv_args.decode_pp_size == self.prefill_pp_size, "Decode pp size must be equal to prefill pp size"
                 bootstrap_infos.append([])
                 for target_tp_rank in self.target_tp_ranks:
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank,
-                        prefill_pp_rank,
+                        self.kv_mgr.kv_args.decode_pp_rank,
                         self.target_dp_group,
                     )
                     if bootstrap_info is not None:
-                        # NOTE: only support MLA for now: select one prefill rank as real rank
                         bootstrap_info["is_dummy"] = not bool(
                             target_tp_rank == self.target_tp_rank
                             or self.target_tp_rank is None
@@ -929,14 +956,13 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         logger.debug(
                             f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank}"
                         )
-                        bootstrap_infos[prefill_pp_rank].append(bootstrap_info)
+                        bootstrap_infos[0].append(bootstrap_info)
                     else:
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
                             f"Could not fetch bootstrap info for engine rank: {self.kv_mgr.kv_args.engine_rank} and target_dp_group: {self.target_dp_group}, prefill_pp_rank: {prefill_pp_rank}",
                         )
                         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
-                        return
 
             self.bootstrap_infos = bootstrap_infos
             self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
@@ -1023,8 +1049,10 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return cls._socket_cache[endpoint], cls._socket_locks[endpoint]
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        for prefill_pp_rank in range(self.prefill_pp_size):
-            for bootstrap_info in self.bootstrap_infos[prefill_pp_rank]:
+        # for prefill_pp_rank in range(self.prefill_pp_size):
+        for bootstrap_info_list in self.bootstrap_infos:
+            # for bootstrap_info in self.bootstrap_infos[prefill_pp_rank]:
+            for bootstrap_info in bootstrap_info_list:
                 self.prefill_server_url = (
                     f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
                 )

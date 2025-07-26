@@ -25,6 +25,8 @@ class KVArgs:
     gpu_id: int
     # for different tp
     decode_tp_size: int
+    decode_pp_size: int
+    decode_pp_rank: int
     # for pp prefill
     prefill_pp_size: int
     prefill_pp_rank: int

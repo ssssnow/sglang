@@ -231,6 +231,7 @@ class ServerArgs:
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
     disaggregation_prefill_pp: Optional[int] = 1
+    disaggregation_decode_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
@@ -526,6 +527,7 @@ class ServerArgs:
             ), "Cannot set --disaggregation-decode-dp for the decode engine."
 
             self.disable_radix_cache = True
+            self.disaggregation_decode_pp = self.pp_size
             logger.warning("KV cache is forced as chunk cache for decode server")
         elif self.disaggregation_mode == "prefill":
             if self.disaggregation_decode_tp is None:
@@ -1572,6 +1574,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_prefill_pp,
             help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
+        )
+        parser.add_argument(
+            "--disaggregation-decode-pp",
+            type=int,
+            default=ServerArgs.disaggregation_decode_pp,
+            help="Decode pp size. If not set, it is default to 1. This is only set on the decode server.",
         )
         parser.add_argument(
             "--disaggregation-ib-device",

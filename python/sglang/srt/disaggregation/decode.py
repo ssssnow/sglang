@@ -24,7 +24,7 @@ import logging
 from collections import deque
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import TYPE_CHECKING, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, List, Dict, Optional, Tuple, Union
 
 import torch
 from torch.distributed import ProcessGroup
@@ -44,13 +44,14 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     prepare_abort,
 )
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch, GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import require_mlp_sync
+from sglang.srt.utils import require_mlp_sync, point_to_point_pyobj
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,8 @@ class DecodePreallocQueue:
         bootstrap_port: int,
         max_total_num_tokens: int,
         prefill_pp_size: int,
+        decode_pp_size: int,
+        pp_rank: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -178,6 +181,8 @@ class DecodePreallocQueue:
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
         self.prefill_pp_size = prefill_pp_size
+        self.decode_pp_size = decode_pp_size
+        self.pp_rank = pp_rank
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -187,7 +192,9 @@ class DecodePreallocQueue:
         attn_tp_size = self.tp_size // self.dp_size
         kv_args.engine_rank = self.tp_rank % (attn_tp_size)
         kv_args.decode_tp_size = attn_tp_size
-        kv_args.prefill_pp_size = self.prefill_pp_size
+        # kv_args.prefill_pp_size = self.prefill_pp_size
+        kv_args.decode_pp_size = self.decode_pp_size
+        kv_args.decode_pp_rank = self.pp_rank
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -676,6 +683,179 @@ class SchedulerDisaggregationDecodeMixin:
                 self.maybe_sleep_on_idle()
 
             self.last_batch = batch
+
+    @torch.no_grad()
+    def event_loop_normal_pp_disagg_decode(self: Scheduler) -> None:
+        """A normal pp scheduler loop for decode worker in disaggregation mode."""
+        mbs = [None] * self.pp_size
+        last_mbs = [None] * self.pp_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+        ]
+        bids = [None] * self.pp_size
+        pp_outputs: Optional[PPProxyTensors] = None
+        # unsend_reqs: Dict[str, Req] = {}
+
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_size):
+                result_set = False
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = last_mbs[mb_id]
+
+                recv_reqs = self.recv_requests()
+                # if recv_reqs is not None and len(recv_reqs) > 0:
+                #     for req in recv_reqs:
+                #         if hasattr(req, "rid"):
+                #             unsend_reqs[req.rid] = req
+                self.process_input_requests(recv_reqs)
+                self.process_decode_queue()
+                mbs[mb_id] = self.get_next_disagg_decode_batch_to_run()
+                self.running_mbs[mb_id] = self.running_batch
+
+                # if require_mlp_sync(self.server_args):
+                #     mbs[mb_id], _ = self.prepare_mlp_sync_batch(mbs[mb_id])
+                self.cur_batch = mbs[mb_id]
+
+                if self.cur_batch:
+                    server_is_idle = False
+                    # Generate fake extend output.
+                    if self.cur_batch.forward_mode.is_extend() and self.pp_group.is_last_rank:
+                        # only last rank can stream output
+                        self.stream_output(
+                            self.cur_batch.reqs, any(req.return_logprob for req in self.cur_batch.reqs)
+                        )
+                        if require_mlp_sync(self.server_args):
+                            self._prepare_idle_batch_and_run(None)
+                    else:
+                        if require_mlp_sync(self.server_args):
+                            self.prepare_mlp_sync_batch(self.cur_batch)
+                        result = self.run_batch(self.cur_batch)
+                        result_set = True
+                        # self.process_batch_result(self.cur_batch, result)
+                elif require_mlp_sync(self.server_args):
+                    self.cur_batch, _ = self._prepare_idle_batch_and_run(None)
+                
+                # (last rank) send the outputs to the next step
+                if self.pp_group.is_last_rank:
+                    if self.cur_batch and result_set:
+                        next_token_ids, bids[mb_id] = (
+                            result.next_token_ids,
+                            result.bid,
+                        )
+                        if self.cur_batch.return_logprob:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                    "extend_input_len_per_req": result.extend_input_len_per_req,
+                                    "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
+                                }
+                                | (
+                                    {
+                                        f"logits_output.{k}": v
+                                        for k, v in result.logits_output.__dict__.items()
+                                    }
+                                    if result.logits_output is not None
+                                    else {}
+                                )
+                            )
+                        else:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                }
+                            )
+                        # send the output from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+                
+                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs = None
+                if mbs[next_mb_id] is not None:
+                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    logits_output_args = {
+                        k[len("logits_output.") :]: v
+                        for k, v in next_pp_outputs.tensors.items()
+                        if k.startswith("logits_output.")
+                    }
+                    if len(logits_output_args) > 0:
+                        logits_output = LogitsProcessorOutput(**logits_output_args)
+                    else:
+                        logits_output = None
+                    output_result = GenerationBatchResult(
+                        logits_output=logits_output,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_input_len_per_req", None
+                        ),
+                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_logprob_start_len_per_req", None
+                        ),
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph if result_set else False,
+                    )
+                    self.process_batch_result(mbs[next_mb_id], output_result)
+                    last_mbs[next_mb_id] = mbs[next_mb_id]
+
+                # (not last rank)
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch and result_set:
+                        bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if pp_outputs:
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                    if self.attn_tp_rank == 0:
+                        # tobe_sent_reqs = []
+                        # if mbs[mb_id] is not None:
+                        #     for req in mbs[mb_id].reqs:
+                        #         if req.rid in unsend_reqs:
+                        #             tobe_sent_reqs.append(unsend_reqs[req.rid])
+                        #             unsend_reqs.pop(req.rid)
+
+                        # send out reqs to the next stage
+                        dp_offset = self.attn_dp_rank * self.attn_tp_size
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch and result_set:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+                pp_outputs = next_pp_outputs
+
+            # When the server is idle, self-check and re-init some states
+            # check if member of mbs is all None
+            if server_is_idle and (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                == 0
+            ):
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+            self.running_batch.batch_is_full = False
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
