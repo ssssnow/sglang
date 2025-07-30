@@ -20,6 +20,7 @@ Life cycle of a request in the decode server
 
 from __future__ import annotations
 
+import time
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -531,6 +532,8 @@ class DecodeTransferQueue:
     def __init__(
         self,
         gloo_group: ProcessGroup,
+        world_group: ProcessGroup,
+        pp_group: ProcessGroup,
         req_to_metadata_buffer_idx_allocator: ReqToMetadataIdxAllocator,
         tp_rank: int,
         metadata_buffers: MetadataBuffers,
@@ -539,6 +542,8 @@ class DecodeTransferQueue:
     ):
         self.queue: List[DecodeRequest] = []
         self.gloo_group = gloo_group
+        self.world_group = world_group
+        self.pp_group = pp_group
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
         self.tp_rank = tp_rank
         self.metadata_buffers = metadata_buffers
@@ -552,16 +557,26 @@ class DecodeTransferQueue:
     def extend(self, decode_reqs: List[DecodeRequest]) -> None:
         self.queue.extend(decode_reqs)
 
-    def pop_transferred(self) -> List[Req]:
+    def pop_transferred(self, sent_rids: List[str] = None) -> List[Req]:
         if not self.queue:
             return []
-        polls = poll_and_all_reduce(
-            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
-        )
+        # use all_tp_group here to ensure all pp ranks can poll the kv cache
+        # but this may not compatible with dp 
+        if self.pp_group.is_last_rank:
+            poll_reqs = [decode_req for decode_req in self.queue]
+        else:
+            poll_reqs = [decode_req for decode_req in self.queue if sent_rids is None or decode_req.req.rid in sent_rids]
+        
+        if len(poll_reqs) > 0:
+            polls = poll_and_all_reduce(
+                [decode_req.kv_receiver for decode_req in poll_reqs], self.world_group
+            )
+        else:
+            return []
 
         transferred_reqs = []
         indices_to_remove = set()
-        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
+        for i, (decode_req, poll) in enumerate(zip(poll_reqs, polls)):
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -694,37 +709,48 @@ class SchedulerDisaggregationDecodeMixin:
         ]
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
-        # unsend_reqs: Dict[str, Req] = {}
 
+        sent_rids = []
+        upstream_transfered_rids = []
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_size):
                 result_set = False
+                transfered_done = False
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
                 recv_reqs = self.recv_requests()
-                # if recv_reqs is not None and len(recv_reqs) > 0:
-                #     for req in recv_reqs:
-                #         if hasattr(req, "rid"):
-                #             unsend_reqs[req.rid] = req
+                # recv transferred reqs from previous pp stage
+                if not self.pp_group.is_first_rank:
+                    upstream_transfered_reqs = self.recv_transfered_requests()
+                    for rid in upstream_transfered_reqs:
+                        upstream_transfered_rids.append(rid)
+                        # logger.info(f"recv upstream_transfered_reqs: {rid}, timestamp: {time.time()}")
+
                 self.process_input_requests(recv_reqs)
-                self.process_decode_queue()
+                self.process_decode_queue(sent_rids, upstream_transfered_rids)
+                
+                # TODO: need to rm used rids in sent_rids
+
                 mbs[mb_id] = self.get_next_disagg_decode_batch_to_run()
                 self.running_mbs[mb_id] = self.running_batch
-
-                # if require_mlp_sync(self.server_args):
-                #     mbs[mb_id], _ = self.prepare_mlp_sync_batch(mbs[mb_id])
                 self.cur_batch = mbs[mb_id]
 
                 if self.cur_batch:
                     server_is_idle = False
                     # Generate fake extend output.
-                    if self.cur_batch.forward_mode.is_extend() and self.pp_group.is_last_rank:
+                    if self.cur_batch.forward_mode.is_extend():
+                        # if self.pp_group.is_last_rank:
                         # only last rank can stream output
                         self.stream_output(
                             self.cur_batch.reqs, any(req.return_logprob for req in self.cur_batch.reqs)
                         )
+                        transfered_done = True
+                        next_mb_id = (mb_id + 1) % self.pp_size
+                        last_mbs[next_mb_id] = self.cur_batch
+                        # set mbs[mb_id] to None to avoid next stage to receive the output, which should be delayed to next next stage
+                        mbs[mb_id] = None
                         if require_mlp_sync(self.server_args):
                             self._prepare_idle_batch_and_run(None)
                     else:
@@ -732,7 +758,6 @@ class SchedulerDisaggregationDecodeMixin:
                             self.prepare_mlp_sync_batch(self.cur_batch)
                         result = self.run_batch(self.cur_batch)
                         result_set = True
-                        # self.process_batch_result(self.cur_batch, result)
                 elif require_mlp_sync(self.server_args):
                     self.cur_batch, _ = self._prepare_idle_batch_and_run(None)
                 
@@ -804,7 +829,6 @@ class SchedulerDisaggregationDecodeMixin:
                         can_run_cuda_graph=result.can_run_cuda_graph if result_set else False,
                     )
                     self.process_batch_result(mbs[next_mb_id], output_result)
-                    last_mbs[next_mb_id] = mbs[next_mb_id]
 
                 # (not last rank)
                 if not self.pp_group.is_last_rank:
@@ -817,7 +841,6 @@ class SchedulerDisaggregationDecodeMixin:
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
-
                     if self.attn_tp_rank == 0:
                         # tobe_sent_reqs = []
                         # if mbs[mb_id] is not None:
@@ -836,12 +859,31 @@ class SchedulerDisaggregationDecodeMixin:
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
 
+                        # add send transfered reqs to sync with next pp stage
+                        rids_to_send = []
+                        if self.cur_batch is not None and transfered_done:
+                            for req in self.cur_batch.reqs:
+                                if hasattr(req, "rid"):
+                                    rids_to_send.append(req.rid)
+                        point_to_point_pyobj(
+                            rids_to_send,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                    for req in recv_reqs:
+                        if hasattr(req, "rid"):
+                            sent_rids.append(req.rid)
+                        
                     # send out proxy tensors to the next stage
                     if self.cur_batch and result_set:
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+
                 pp_outputs = next_pp_outputs
 
             # When the server is idle, self-check and re-init some states
@@ -850,6 +892,7 @@ class SchedulerDisaggregationDecodeMixin:
                 len(self.waiting_queue)
                 + len(self.disagg_decode_transfer_queue.queue)
                 + len(self.disagg_decode_prealloc_queue.queue)
+                + len(self.transfered_reqs)
                 == 0
             ):
                 self.check_memory()
@@ -973,7 +1016,6 @@ class SchedulerDisaggregationDecodeMixin:
             else:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
-
         return ret
 
     def get_new_prebuilt_batch(self: Scheduler) -> Optional[ScheduleBatch]:
@@ -1025,7 +1067,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler, sent_rids: List[str] = None, upstream_transfered_rids: List[str] = None):
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -1036,6 +1078,19 @@ class SchedulerDisaggregationDecodeMixin:
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (
-            self.disagg_decode_transfer_queue.pop_transferred()
+            self.disagg_decode_transfer_queue.pop_transferred(sent_rids)
         )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        self.transfered_reqs.extend(alloc_reqs)
+        if self.pp_group.is_first_rank:
+            self.waiting_queue.extend(alloc_reqs)
+            self.transfered_reqs = []
+        else:
+            tmp_transfered_reqs = []
+            for req in self.transfered_reqs:
+                if req.rid in upstream_transfered_rids:
+                    self.waiting_queue.append(req)
+                    upstream_transfered_rids.remove(req.rid)
+                else:
+                    tmp_transfered_reqs.append(req)
+            self.transfered_reqs = tmp_transfered_reqs
+        # self.waiting_queue.extend(alloc_reqs)

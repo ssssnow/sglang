@@ -241,14 +241,22 @@ class MooncakeKVManager(BaseKVManager):
         )
 
         num_layers = len(self.kv_args.kv_data_ptrs)
-        # only support decode pp_size == 1 for now
-        assert self.kv_args.prefill_start_layer+num_layers <= len(dst_kv_ptrs), (
-            f"prefill_start_layer: {self.kv_args.prefill_start_layer}, num_layers: {num_layers}, len(dst_kv_ptrs): {len(dst_kv_ptrs)}"
-        )
+        layer_offset = self.kv_args.prefill_start_layer
+        if len(dst_kv_ptrs) > num_layers:
+            # indicates prefill pp_size > decode pp_size
+            assert self.kv_args.prefill_start_layer+num_layers <= len(dst_kv_ptrs), (
+                f"prefill_start_layer: {self.kv_args.prefill_start_layer}, num_layers: {num_layers}, len(dst_kv_ptrs): {len(dst_kv_ptrs)}"
+            )
+        else:
+            # indicates prefill pp_size == decode pp_size
+            assert num_layers == len(dst_kv_ptrs), (
+                f"support prefill pp_size == decode pp_size for now, num_layers: {num_layers}, len(dst_kv_ptrs): {len(dst_kv_ptrs)}"
+            )
+            layer_offset = 0
         layers_params = [
             (
                 self.kv_args.kv_data_ptrs[layer_id],
-                dst_kv_ptrs[layer_id + self.kv_args.prefill_start_layer],
+                dst_kv_ptrs[layer_id + layer_offset],
                 self.kv_args.kv_item_lens[layer_id],
             )
             for layer_id in range(num_layers)
@@ -422,34 +430,31 @@ class MooncakeKVManager(BaseKVManager):
                             break
 
                         if kv_chunk.is_last:
-                            if self.kv_args.prefill_pp_rank == (self.kv_args.prefill_pp_size-1):
-                                # Only the last chunk we need to send the aux data
-                                ret = self.send_aux(
-                                    req.mooncake_session_id,
-                                    kv_chunk.prefill_aux_index,
-                                    self.decode_kv_args_table[
-                                        req.mooncake_session_id
-                                    ].dst_aux_ptrs,
-                                    req.dst_aux_index,
-                                )
-                                polls.append(True if ret == 0 else False)
-                            else:
-                                self.update_status(req.room, KVPoll.Success)
-                                polls.append(True)
+                            # if self.kv_args.prefill_pp_rank == (self.kv_args.prefill_pp_size-1):
+                            # Only the last chunk we need to send the aux data
+                            ret = self.send_aux(
+                                req.mooncake_session_id,
+                                kv_chunk.prefill_aux_index,
+                                self.decode_kv_args_table[
+                                    req.mooncake_session_id
+                                ].dst_aux_ptrs,
+                                req.dst_aux_index,
+                            )
+                            polls.append(True if ret == 0 else False)
 
                             dst_ranks_infos.append(
                                 (req.endpoint, req.dst_port, req.room)
                             )
 
                             # Only sync status when all the dst ranks have received the kvcache
-                            if self.kv_args.prefill_pp_rank == (self.kv_args.prefill_pp_size-1):
-                                if len(polls) == req.required_dst_info_num:
-                                    status = KVPoll.Success if all(polls) else KVPoll.Failed
-                                    self.update_status(req.room, status)
-                                    for endpoint, dst_port, room in dst_ranks_infos:
-                                        self.sync_status_to_decode_endpoint(
-                                            endpoint, dst_port, room, status
-                                        )
+                            if len(polls) == req.required_dst_info_num:
+                                status = KVPoll.Success if all(polls) else KVPoll.Failed
+                                self.update_status(req.room, status)
+                                for endpoint, dst_port, room in dst_ranks_infos:
+                                    self.sync_status_to_decode_endpoint(
+                                        endpoint, dst_port, room, status
+                                    )
+                                logger.info(f"last rank send aux data successfully, update req.room {req.room} status to {status}, and sync status to decode endpoint: {endpoint}:{dst_port}:{room}")
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint

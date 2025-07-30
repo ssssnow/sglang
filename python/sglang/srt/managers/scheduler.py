@@ -386,6 +386,7 @@ class Scheduler(
 
         # Init running status
         self.waiting_queue: List[Req] = []
+        self.transfered_reqs: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # The current forward batch
@@ -645,6 +646,8 @@ class Scheduler(
             # The decode requests polling kv cache
             self.disagg_decode_transfer_queue = DecodeTransferQueue(
                 gloo_group=self.attn_tp_cpu_group,
+                world_group=self.world_group.cpu_group,
+                pp_group=self.pp_group,
                 req_to_metadata_buffer_idx_allocator=self.req_to_metadata_buffer_idx_allocator,
                 tp_rank=self.tp_rank,
                 metadata_buffers=self.disagg_metadata_buffers,
@@ -998,6 +1001,27 @@ class Scheduler(
                 src=self.tp_group.ranks[0],
             )
         return recv_reqs
+
+    def recv_transfered_requests(self) -> List[Req]:
+        upstream_transfered_reqs = []
+        if not self.pp_group.is_first_rank:
+            if self.attn_tp_rank == 0:
+                dp_offset = self.attn_dp_rank * self.attn_tp_size
+                upstream_transfered_reqs = point_to_point_pyobj(
+                    [],
+                    self.pp_rank * self.tp_size + dp_offset,
+                    self.world_group.cpu_group,
+                    (self.pp_rank - 1) * self.tp_size + dp_offset,
+                    self.pp_rank * self.tp_size + dp_offset,
+                )
+            if self.tp_size != 1:
+                upstream_transfered_reqs = broadcast_pyobj(
+                    upstream_transfered_reqs,
+                    self.tp_group.rank,
+                    self.tp_cpu_group,
+                    src=self.tp_group.ranks[0],
+                )
+        return upstream_transfered_reqs
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:
