@@ -714,39 +714,58 @@ class SchedulerDisaggregationDecodeMixin:
         bids = [None] * self.pp_size
         pp_outputs: Optional[PPProxyTensors] = None
 
+        # the key point of this loop is to sync kvcache transfer status between pp stages
+        # synchronize has two steps:
+        #     1. synchronize within attn tp ranks
+        #     2. synchronize between pp ranks
+        #       2.1 send transfered rids to next pp stage, just like 'pp_outputs'
+        #       2.2 we do not use dist operation to avoid hang, since there has been so many sync operations in the loop
+        #
+        # the flow of req is :
+        #     1. recv_reqs -> prealloc_queue and pending_rids -> transfered_queue -> ready_rids -> waiting_queue
+
+        # request ids that is received but not scheduled
         pending_rids = []
+
+        # ready to roll requests' ids, received from previous pp stage
         ready_rids = []
+
         first_rank_recv_step = 0
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_size):
+                # whether get a result from run_batch or not
+                #   1. if set, need to send pp_hidden_states_proxy_tensors to next stage
+                #   2. if not set, indicates the first arrival of a batch, only need to stream output
                 result_set = False
-                transfered_done = False
-                common_transfer_rids = []
+
+                # whether the current batch is ready to send to next stage
+                # in pp, the first rank always decide whether a batch is ready to run
+                ready_to_send_to_next_stage = False
+
+                # transfered rids that synced with previous pp stage
+                synced_transfered_rids = []
+
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
-
                 recv_reqs = self.recv_requests()
-                # recv transferred reqs from previous pp stage
+
+                # recv ready requests' ids from previous pp stage
                 if not self.pp_group.is_first_rank:
                     upstream_ready_rids = self.recv_ready_requests()
                     ready_rids.extend(upstream_ready_rids)
-                    # put upstream_transfered_rids to waiting_queue
-                    ready_reqs = []
-                    for req in self.transfered_reqs:
-                        if req.rid in ready_rids:
-                            # logger.info(f"pending_rids: {pending_rids}, ready_rids: {ready_rids}, req.rid: {req.rid}")
-                            ready_reqs.append(req)
-                            pending_rids.remove(req.rid)
-                    self.waiting_queue.extend(ready_reqs)
+                    # put ready requests to waiting_queue and remove ready rids from pending_rids
+                    self.waiting_queue.extend([req for req in self.transfered_reqs if req.rid in ready_rids])
+                    pending_rids = [rid for rid in pending_rids if rid not in ready_rids]
                     self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in ready_rids]
                     ready_rids = []
                 
+                # recv transferred reqs from previous pp stage and 
+                # find common rids between transfered_rids and local_transfered_rids
                 if len(pending_rids) > 0 and not self.pp_group.is_first_rank:
-                    transfer_rids = self.recv_transfer_rids()
+                    transfered_rids = self.recv_transfer_rids()
                     local_transfered_rids = [req.rid for req in self.transfered_reqs]
-                    # find common rids between transfer_rids and local_transfered_rids
-                    common_transfer_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
+                    synced_transfered_rids = [rid for rid in transfered_rids if rid in local_transfered_rids]
                 
                 self.process_input_requests(recv_reqs)
                 self.process_decode_queue()
@@ -763,7 +782,7 @@ class SchedulerDisaggregationDecodeMixin:
                         self.stream_output(
                             self.cur_batch.reqs, any(req.return_logprob for req in self.cur_batch.reqs)
                         )
-                        transfered_done = True
+                        ready_to_send_to_next_stage = True
                         next_mb_id = (mb_id + 1) % self.pp_size
                         last_mbs[next_mb_id] = self.cur_batch
                         # set mbs[mb_id] to None to avoid next stage to receive the output, which should be delayed to next next stage
@@ -865,15 +884,15 @@ class SchedulerDisaggregationDecodeMixin:
                             transfer_rids = self.recv_transfer_rids()
                             local_transfered_rids = [req.rid for req in self.transfered_reqs]
                             # find common rids between transfer_rids and local_transfered_rids
-                            common_transfer_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
+                            synced_transfered_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
 
                             # TODO: delay 2 steps
                             ready_reqs = []
                             for req in self.transfered_reqs:
-                                if req.rid in common_transfer_rids:
+                                if req.rid in synced_transfered_rids:
                                     ready_reqs.append(req)
                             self.waiting_queue.extend(ready_reqs)
-                            self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in common_transfer_rids]
+                            self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in synced_transfered_rids]
                             ready_rids = []
                         else:
                             first_rank_recv_step += 1
@@ -882,7 +901,7 @@ class SchedulerDisaggregationDecodeMixin:
 
 
                     rids_to_send = []
-                    if self.cur_batch is not None and transfered_done:
+                    if self.cur_batch is not None and ready_to_send_to_next_stage:
                         for req in self.cur_batch.reqs:
                             if hasattr(req, "rid"):
                                 rids_to_send.append(req.rid)
@@ -915,7 +934,7 @@ class SchedulerDisaggregationDecodeMixin:
                     if self.pp_group.is_first_rank:
                         transfer_rids = [req.rid for req in self.transfered_reqs]
                     else:
-                        transfer_rids = common_transfer_rids
+                        transfer_rids = synced_transfered_rids
                     dp_offset = self.attn_dp_rank * self.attn_tp_size
                     point_to_point_pyobj(
                         transfer_rids,
