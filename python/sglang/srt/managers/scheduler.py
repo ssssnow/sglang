@@ -1002,12 +1002,12 @@ class Scheduler(
             )
         return recv_reqs
 
-    def recv_transfered_requests(self) -> List[Req]:
-        upstream_transfered_reqs = []
+    def recv_ready_requests(self) -> List[Req]:
+        upstream_ready_reqs = []
         if not self.pp_group.is_first_rank:
             if self.attn_tp_rank == 0:
                 dp_offset = self.attn_dp_rank * self.attn_tp_size
-                upstream_transfered_reqs = point_to_point_pyobj(
+                upstream_ready_reqs = point_to_point_pyobj(
                     [],
                     self.pp_rank * self.tp_size + dp_offset,
                     self.world_group.cpu_group,
@@ -1015,13 +1015,33 @@ class Scheduler(
                     self.pp_rank * self.tp_size + dp_offset,
                 )
             if self.tp_size != 1:
-                upstream_transfered_reqs = broadcast_pyobj(
-                    upstream_transfered_reqs,
+                upstream_ready_reqs = broadcast_pyobj(
+                    upstream_ready_reqs,
                     self.tp_group.rank,
                     self.tp_cpu_group,
                     src=self.tp_group.ranks[0],
                 )
-        return upstream_transfered_reqs
+        return upstream_ready_reqs
+    
+    def recv_transfer_rids(self) -> List[str]:
+        transfer_rids = []
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            transfer_rids = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.cpu_group,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        if self.tp_size != 1:
+            transfer_rids = broadcast_pyobj(
+                transfer_rids,
+                self.tp_group.rank,
+                self.tp_cpu_group,
+                src=self.tp_group.ranks[0],
+            )
+        return transfer_rids
 
     def process_input_requests(self, recv_reqs: List):
         for recv_req in recv_reqs:

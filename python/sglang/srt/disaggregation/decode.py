@@ -562,21 +562,25 @@ class DecodeTransferQueue:
             return []
         # use all_tp_group here to ensure all pp ranks can poll the kv cache
         # but this may not compatible with dp 
-        if self.pp_group.is_last_rank:
-            poll_reqs = [decode_req for decode_req in self.queue]
-        else:
-            poll_reqs = [decode_req for decode_req in self.queue if sent_rids is None or decode_req.req.rid in sent_rids]
+        # if self.pp_group.is_last_rank:
+        #     poll_reqs = [decode_req for decode_req in self.queue]
+        # else:
+        #     poll_reqs = [decode_req for decode_req in self.queue if sent_rids is None or decode_req.req.rid in sent_rids]
         
-        if len(poll_reqs) > 0:
-            polls = poll_and_all_reduce(
-                [decode_req.kv_receiver for decode_req in poll_reqs], self.world_group
-            )
-        else:
-            return []
+        # if len(poll_reqs) > 0:
+        #     polls = poll_and_all_reduce(
+        #         [decode_req.kv_receiver for decode_req in poll_reqs], self.world_group
+        #     )
+        # else:
+        #     return []
+
+        polls = poll_and_all_reduce(
+            [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
+        )
 
         transferred_reqs = []
         indices_to_remove = set()
-        for i, (decode_req, poll) in enumerate(zip(poll_reqs, polls)):
+        for i, (decode_req, poll) in enumerate(zip(self.queue, polls)):
             if poll == KVPoll.Failed:
                 error_message = f"Decode transfer failed for request rank={self.tp_rank} {decode_req.req.rid=} {decode_req.req.bootstrap_room=}"
                 try:
@@ -711,29 +715,62 @@ class SchedulerDisaggregationDecodeMixin:
         pp_outputs: Optional[PPProxyTensors] = None
 
         sent_rids = []
-        upstream_transfered_rids = []
+        pending_rids = []
+        ready_rids = []
+        frist_rank_recv_step = 0
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_size):
                 result_set = False
                 transfered_done = False
+                common_transfer_rids = []
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = last_mbs[mb_id]
 
                 recv_reqs = self.recv_requests()
+                # logger.info(f"recv_req done, timestamp: {time.time()}")
                 # recv transferred reqs from previous pp stage
                 if not self.pp_group.is_first_rank:
-                    upstream_transfered_reqs = self.recv_transfered_requests()
-                    for rid in upstream_transfered_reqs:
-                        upstream_transfered_rids.append(rid)
+                    upstream_ready_rids = self.recv_ready_requests()
+                    # logger.info(f"recv ready_reqs done, timestamp: {time.time()}")
+                    ready_rids.extend(upstream_ready_rids)
+                    # for rid in upstream_ready_rids:
+                    #     ready_rids.append(rid)
                         # logger.info(f"recv upstream_transfered_reqs: {rid}, timestamp: {time.time()}")
-
+                    # put upstream_transfered_rids to waiting_queue
+                    ready_reqs = []
+                    for req in self.transfered_reqs:
+                        if req.rid in ready_rids:
+                            # logger.info(f"pending_rids: {pending_rids}, ready_rids: {ready_rids}, req.rid: {req.rid}")
+                            ready_reqs.append(req)
+                            pending_rids.remove(req.rid)
+                    self.waiting_queue.extend(ready_reqs)
+                    self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in ready_rids]
+                    ready_rids = []
+                
+                # logger.info(f"pending_rids: {pending_rids}, ready_rids: {ready_rids}, first_rank_recv_step: {frist_rank_recv_step}")
+                if len(pending_rids) > 0 and not self.pp_group.is_first_rank:
+                    # logger.info(f"start to recv transfer_rids, timestamp: {time.time()}")
+                    transfer_rids = self.recv_transfer_rids()
+                    # logger.info(f"recv transfer_rids done, timestamp: {time.time()}")
+                    local_transfered_rids = [req.rid for req in self.transfered_reqs]
+                    # find common rids between transfer_rids and local_transfered_rids
+                    common_transfer_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
+                    # logger.info(f"pending_rids: {pending_rids}, common_transfer_rids: {common_transfer_rids}, local_transfered_rids: {local_transfered_rids}, transfer_rids: {transfer_rids}")
+                
+                # logger.info(f"start to process_input_requests, timestamp: {time.time()}")
                 self.process_input_requests(recv_reqs)
-                self.process_decode_queue(sent_rids, upstream_transfered_rids)
+                self.process_decode_queue()
+                # logger.info(f"process_decode_queue done, timestamp: {time.time()}")
                 
                 # TODO: need to rm used rids in sent_rids
 
+                # logger.info(f"waiting queue len: {len(self.waiting_queue)}")
                 mbs[mb_id] = self.get_next_disagg_decode_batch_to_run()
+                last_mbs[mb_id] = None
+                # if mbs[mb_id] is not None and len(mbs[mb_id].reqs) > 1:
+                #     logger.info(f"len of cur mbs reqs is : {len(mbs[mb_id].reqs)}")
+                # logger.info(f"waiting queue len after schedule: {len(self.waiting_queue)}")
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch = mbs[mb_id]
 
@@ -743,9 +780,11 @@ class SchedulerDisaggregationDecodeMixin:
                     if self.cur_batch.forward_mode.is_extend():
                         # if self.pp_group.is_last_rank:
                         # only last rank can stream output
+                        # logger.info(f"start to stream_output, timestamp: {time.time()}")
                         self.stream_output(
                             self.cur_batch.reqs, any(req.return_logprob for req in self.cur_batch.reqs)
                         )
+                        # logger.info(f"stream_output done, timestamp: {time.time()}")
                         transfered_done = True
                         next_mb_id = (mb_id + 1) % self.pp_size
                         last_mbs[next_mb_id] = self.cur_batch
@@ -756,7 +795,9 @@ class SchedulerDisaggregationDecodeMixin:
                     else:
                         if require_mlp_sync(self.server_args):
                             self.prepare_mlp_sync_batch(self.cur_batch)
+                        # logger.info(f"start to run_batch, timestamp: {time.time()}")
                         result = self.run_batch(self.cur_batch)
+                        # logger.info(f"run_batch done, timestamp: {time.time()}")
                         result_set = True
                 elif require_mlp_sync(self.server_args):
                     self.cur_batch, _ = self._prepare_idle_batch_and_run(None)
@@ -791,20 +832,24 @@ class SchedulerDisaggregationDecodeMixin:
                                 }
                             )
                         # send the output from the last round to let the next stage worker run post processing
+                        # logger.info(f"start to send output, timestamp: {time.time()}")
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        # logger.info(f"last rank send output done, timestamp: {time.time()}")
                 
                 # receive outputs and post-process (filter finished reqs) the coming microbatch
                 next_mb_id = (mb_id + 1) % self.pp_size
                 next_pp_outputs = None
                 if mbs[next_mb_id] is not None:
+                    # logger.info(f"start to recv next_pp_outputs, timestamp: {time.time()}")
                     next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
                         self.pp_group.recv_tensor_dict(
                             all_gather_group=self.attn_tp_group
                         )
                     )
+                    # logger.info(f"non last rank recv next_pp_outputs done, timestamp: {time.time()}")
                     mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
                     logits_output_args = {
                         k[len("logits_output.") :]: v
@@ -828,6 +873,7 @@ class SchedulerDisaggregationDecodeMixin:
                         bid=bids[next_mb_id],
                         can_run_cuda_graph=result.can_run_cuda_graph if result_set else False,
                     )
+                    # logger.info(f"start to process_batch_result, batch size: {len(mbs[next_mb_id].reqs)}")
                     self.process_batch_result(mbs[next_mb_id], output_result)
 
                 # (not last rank)
@@ -837,10 +883,51 @@ class SchedulerDisaggregationDecodeMixin:
                     # carry the outputs to the next stage
                     # send the outputs from the last round to let the next stage worker run post processing
                     if pp_outputs:
+                        # logger.info(f"non last rank start to send output, timestamp: {time.time()}")
                         self.pp_group.send_tensor_dict(
                             pp_outputs.tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        # logger.info(f"non last rank send output done, timestamp: {time.time()}")
+
+                    # recv trans rids here
+                    if len(pending_rids) > 0 and self.pp_group.is_first_rank:
+                        if first_rank_recv_step >= self.pp_size -1:
+                            # logger.info(f"start to recv transfer_rids, timestamp: {time.time()}")
+                            transfer_rids = self.recv_transfer_rids()
+                            # logger.info(f"recv transfer_rids done, timestamp: {time.time()}")
+                            local_transfered_rids = [req.rid for req in self.transfered_reqs]
+                            # logger.info(f"local_transfered_rids: {local_transfered_rids}")
+                            # find common rids between transfer_rids and local_transfered_rids
+                            common_transfer_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
+                            # logger.info(f"pending_rids: {pending_rids}, common_transfer_rids: {common_transfer_rids}, local_transfered_rids: {local_transfered_rids}, transfer_rids: {transfer_rids}")
+
+                            # TODO: delay 2 steps
+                            ready_reqs = []
+                            for req in self.transfered_reqs:
+                                if req.rid in common_transfer_rids:
+                                    ready_reqs.append(req)
+                                    # pending_rids.remove(req.rid)
+                                    # common_transfer_rids.remove(req.rid)
+                            # if len(pending_rids) == 0:
+                            #     logger.info(f"pending_rids is empty, reset first_rank_recv_step to 0")
+                            #     first_rank_recv_step = 0
+                            self.waiting_queue.extend(ready_reqs)
+                            self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in common_transfer_rids]
+                            # logger.info(f"ready reqs : {ready_reqs}, transfered_reqs: {self.transfered_reqs}")
+                            ready_rids = []
+                        else:
+                            first_rank_recv_step += 1
+                    else:
+                        # logger.info(f"first rank, reset first_rank_recv_step to 0")
+                        first_rank_recv_step = 0
+
+
+                    rids_to_send = []
+                    if self.cur_batch is not None and transfered_done:
+                        for req in self.cur_batch.reqs:
+                            if hasattr(req, "rid"):
+                                rids_to_send.append(req.rid)
                     if self.attn_tp_rank == 0:
                         # tobe_sent_reqs = []
                         # if mbs[mb_id] is not None:
@@ -858,13 +945,9 @@ class SchedulerDisaggregationDecodeMixin:
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
+                        # logger.info(f"non last rank send recv_reqs done, timestamp: {time.time()}")
 
                         # add send transfered reqs to sync with next pp stage
-                        rids_to_send = []
-                        if self.cur_batch is not None and transfered_done:
-                            for req in self.cur_batch.reqs:
-                                if hasattr(req, "rid"):
-                                    rids_to_send.append(req.rid)
                         point_to_point_pyobj(
                             rids_to_send,
                             self.pp_rank * self.tp_size + dp_offset,
@@ -872,17 +955,48 @@ class SchedulerDisaggregationDecodeMixin:
                             self.pp_rank * self.tp_size + dp_offset,
                             (self.pp_rank + 1) * self.tp_size + dp_offset,
                         )
-
-                    for req in recv_reqs:
-                        if hasattr(req, "rid"):
-                            sent_rids.append(req.rid)
+                    for rid in rids_to_send:
+                        # logger.info(f"remove rid: {rid} from pending_rids: {pending_rids}")
+                        pending_rids.remove(rid)
+                    if len(pending_rids) == 0:
+                        # logger.info(f"pending_rids is empty, reset first_rank_recv_step to 0")
+                        first_rank_recv_step = 0
+                    # logger.info(f"non last rank send rids_to_send done, timestamp: {time.time()}")
+                        # send transfered reqs' rid to next stage and finally gather in the first rank
                         
+
+                    # for req in recv_reqs:
+                    #     if hasattr(req, "rid"):
+                    #         sent_rids.append(req.rid)
+
+                if len(pending_rids) > 0 and self.attn_tp_rank == 0:
+                    if self.pp_group.is_first_rank:
+                        transfer_rids = [req.rid for req in self.transfered_reqs]
+                    else:
+                        transfer_rids = common_transfer_rids
+                    # transfer_rids = [req.rid for req in self.transfered_reqs]
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    point_to_point_pyobj(
+                        transfer_rids,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                    )
+                    # logger.info(f"non last rank send transfer_rids done, timestamp: {time.time()}")
+                
+                for req in recv_reqs:
+                    if hasattr(req, "rid"):
+                        pending_rids.append(req.rid)
+                        
+                if not self.pp_group.is_last_rank:
                     # send out proxy tensors to the next stage
                     if self.cur_batch and result_set:
                         self.pp_group.send_tensor_dict(
                             result.pp_hidden_states_proxy_tensors,
                             all_gather_group=self.attn_tp_group,
                         )
+                        # logger.info(f"non last rank send pp_hidden_states_proxy_tensors done, timestamp: {time.time()}")
 
                 pp_outputs = next_pp_outputs
 
@@ -1078,19 +1192,20 @@ class SchedulerDisaggregationDecodeMixin:
         req_conns = self.disagg_decode_prealloc_queue.pop_preallocated()
         self.disagg_decode_transfer_queue.extend(req_conns)
         alloc_reqs = (
-            self.disagg_decode_transfer_queue.pop_transferred(sent_rids)
+            self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
         self.transfered_reqs.extend(alloc_reqs)
-        if self.pp_group.is_first_rank:
-            self.waiting_queue.extend(alloc_reqs)
-            self.transfered_reqs = []
-        else:
-            tmp_transfered_reqs = []
-            for req in self.transfered_reqs:
-                if req.rid in upstream_transfered_rids:
-                    self.waiting_queue.append(req)
-                    upstream_transfered_rids.remove(req.rid)
-                else:
-                    tmp_transfered_reqs.append(req)
-            self.transfered_reqs = tmp_transfered_reqs
+
+        # if self.pp_group.is_first_rank:
+        #     self.waiting_queue.extend(alloc_reqs)
+        #     self.transfered_reqs = []
+        # else:
+        #     tmp_transfered_reqs = []
+        #     for req in self.transfered_reqs:
+        #         if req.rid in upstream_transfered_rids:
+        #             self.waiting_queue.append(req)
+        #             upstream_transfered_rids.remove(req.rid)
+        #         else:
+        #             tmp_transfered_reqs.append(req)
+        #     self.transfered_reqs = tmp_transfered_reqs
         # self.waiting_queue.extend(alloc_reqs)
