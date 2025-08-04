@@ -1086,7 +1086,8 @@ async def get_request(
             continue
 
         # Sample the request interval from the exponential distribution.
-        interval = np.random.exponential(1.0 / request_rate)
+        # interval = np.random.exponential(1.0 / request_rate)
+        interval = 1.0 / request_rate
         # The next request will be sent after the interval.
         await asyncio.sleep(interval)
 
@@ -1647,6 +1648,7 @@ class LoRAPathAction(argparse.Action):
 
 
 if __name__ == "__main__":
+    print("using modified bench_serving.py")
     parser = ArgumentParser(description="Benchmark the online serving throughput.")
     parser.add_argument(
         "--backend",

@@ -2,6 +2,7 @@
 Usage:
 python3 -m unittest test_pp_single_node.TestPPAccuracy.test_gsm8k
 python3 -m unittest test_pp_single_node.TestQwenPPAccuracy.test_pp_consistency
+python3 -m unittest test_pp_single_node.TestDSV3PPAccuracy.test_pp_consistency
 python3 -m unittest test_pp_single_node.TestFixedBugs.test_chunked_prefill_with_small_bs
 """
 
@@ -78,7 +79,7 @@ class TestQwenPPAccuracy(unittest.TestCase):
                 "--pp-size",
                 pp_size,
                 "--chunked-prefill-size",
-                256,
+                512,
             ],
         )
 
@@ -101,7 +102,7 @@ class TestQwenPPAccuracy(unittest.TestCase):
     @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
     def test_pp_consistency(self):
         baseline = self.run_gsm8k_test(pp_size=1)
-        pp_metrics = self.run_gsm8k_test(pp_size=2)
+        pp_metrics = self.run_gsm8k_test(pp_size=4)
 
         print(f"[Qwen PP Comparison] Baseline: {baseline} | PP: {pp_metrics}")
 
@@ -115,6 +116,36 @@ class TestQwenPPAccuracy(unittest.TestCase):
             ),
         )
 
+class TestDSV3PPAccuracy(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base_url = "http://10.39.137.107:23334"  # different ports to avoid conflicts
+        cls.model_name = "DeepSeek-V3"  # replace with your Qwen Model if needed
+
+    def run_gsm8k_test(self):
+        try:
+            args = SimpleNamespace(
+                num_shots=5,
+                data_path=None,
+                num_questions=6000,
+                max_new_tokens=512,
+                parallel=128,
+                host="http://10.39.137.107",
+                port=int(self.base_url.split(":")[-1]),
+            )
+            metrics = run_eval(args)
+            time.sleep(5)
+            return metrics
+        finally:
+            pass
+
+    def test_pp_consistency(self):
+        pp_metrics = self.run_gsm8k_test()
+        
+        print(f"[DSV3 PP Comparison] PP: {pp_metrics}")
+
+        
+        
 
 class TestQwenPPTieWeightsAccuracy(unittest.TestCase):
     @classmethod
