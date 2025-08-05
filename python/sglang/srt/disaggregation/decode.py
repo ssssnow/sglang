@@ -560,19 +560,6 @@ class DecodeTransferQueue:
     def pop_transferred(self, sent_rids: List[str] = None) -> List[Req]:
         if not self.queue:
             return []
-        # use all_tp_group here to ensure all pp ranks can poll the kv cache
-        # but this may not compatible with dp 
-        # if self.pp_group.is_last_rank:
-        #     poll_reqs = [decode_req for decode_req in self.queue]
-        # else:
-        #     poll_reqs = [decode_req for decode_req in self.queue if sent_rids is None or decode_req.req.rid in sent_rids]
-        
-        # if len(poll_reqs) > 0:
-        #     polls = poll_and_all_reduce(
-        #         [decode_req.kv_receiver for decode_req in poll_reqs], self.world_group
-        #     )
-        # else:
-        #     return []
 
         polls = poll_and_all_reduce(
             [decode_req.kv_receiver for decode_req in self.queue], self.gloo_group
