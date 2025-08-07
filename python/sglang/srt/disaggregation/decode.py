@@ -151,7 +151,6 @@ class DecodePreallocQueue:
         gpu_id: int,
         bootstrap_port: int,
         max_total_num_tokens: int,
-        prefill_pp_size: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
     ):
@@ -172,13 +171,11 @@ class DecodePreallocQueue:
         self.gpu_id = gpu_id
         self.bootstrap_port = bootstrap_port
         self.max_total_num_tokens = max_total_num_tokens
-        self.prefill_pp_size = prefill_pp_size
         self.num_reserved_decode_tokens = num_reserved_decode_tokens
         self.transfer_backend = transfer_backend
         # Queue for requests pending pre-allocation
         self.queue: List[DecodeRequest] = []
         self.retracted_queue: List[Req] = []
-        self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
 
     def _init_kv_manager(self) -> BaseKVManager:
@@ -192,7 +189,6 @@ class DecodePreallocQueue:
         # Note(shangming): pp is not supported on the decode side yet, so its rank is fixed to 0
         kv_args.pp_rank = 0
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        kv_args.prefill_pp_size = self.prefill_pp_size
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )

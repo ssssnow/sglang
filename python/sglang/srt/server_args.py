@@ -260,7 +260,6 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
-    disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     pdlb_url: Optional[str] = None
@@ -617,7 +616,6 @@ class ServerArgs:
             if self.disaggregation_decode_dp is None:
                 self.disaggregation_decode_dp = self.dp_size
 
-            self.disaggregation_prefill_pp = self.pp_size
             self.validate_disagg_tp_size(self.tp_size, self.disaggregation_decode_tp)
 
             self.disable_cuda_graph = True
@@ -1821,12 +1819,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_dp,
             help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
-        )
-        parser.add_argument(
-            "--disaggregation-prefill-pp",
-            type=int,
-            default=ServerArgs.disaggregation_prefill_pp,
-            help="Prefill pp size. If not set, it is default to 1. This is only set on the decode server.",
         )
         parser.add_argument(
             "--disaggregation-ib-device",
