@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import math
 import os
 import queue
 import socket
@@ -35,6 +36,7 @@ from sglang.srt.disaggregation.common.utils import (
 from sglang.srt.disaggregation.mooncake.transfer_engine import MooncakeTransferEngine
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.distributed import get_pp_group
+from sglang.srt.distributed.utils import get_disagg_mapping_under_pp
 from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
@@ -87,6 +89,10 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     is_dummy: bool
+    prefill_layer_start: int
+    prefill_layer_end: int
+    decode_layer_start: int
+    decode_layer_end: int
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -107,6 +113,10 @@ class TransferInfo:
             dst_aux_index=dst_aux_index,
             required_dst_info_num=int(msg[6].decode("ascii")),
             is_dummy=is_dummy,
+            prefill_layer_start=int(msg[7].decode("ascii")),
+            prefill_layer_end=int(msg[8].decode("ascii")),
+            decode_layer_start=int(msg[9].decode("ascii")),
+            decode_layer_end=int(msg[10].decode("ascii")),
         )
 
 
@@ -303,6 +313,10 @@ class MooncakeKVManager(BaseKVManager):
         prefill_kv_indices: npt.NDArray[np.int32],
         dst_kv_ptrs: list[int],
         dst_kv_indices: npt.NDArray[np.int32],
+        prefill_layer_start: int,
+        prefill_layer_end: int,
+        decode_layer_start: int,
+        decode_layer_end: int,
         executor: concurrent.futures.ThreadPoolExecutor,
     ):
         # Group by indices
@@ -312,47 +326,53 @@ class MooncakeKVManager(BaseKVManager):
 
         layers_params = None
 
+
+        assert decode_layer_end - decode_layer_start == prefill_layer_end - prefill_layer_start, \
+            f"decode_layer_end - decode_layer_start ({decode_layer_end - decode_layer_start}) must be equal to prefill_layer_end - prefill_layer_start ({prefill_layer_end - prefill_layer_start})"
+        
+        assert decode_layer_end - decode_layer_start <= len(dst_kv_ptrs), \
+            f"decode_layer_end - decode_layer_start ({decode_layer_end - decode_layer_start}) must be less than or equal to len(dst_kv_ptrs) ({len(dst_kv_ptrs)})"
+        
+        assert prefill_layer_end - prefill_layer_start <= len(self.kv_args.kv_data_ptrs), \
+            f"prefill_layer_end - prefill_layer_start ({prefill_layer_end - prefill_layer_start}) must be less than or equal to len(self.kv_args.kv_data_ptrs) ({len(self.kv_args.kv_data_ptrs)})"
+        
         # pp is not supported on the decode side yet
-        start_layer = self.kv_args.prefill_start_layer
-        end_layer = start_layer + len(self.kv_args.kv_data_ptrs)
         if self.is_mla_backend:
             src_kv_ptrs = self.kv_args.kv_data_ptrs
-            layers_per_pp_stage = len(src_kv_ptrs)
-            dst_kv_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_kv_ptrs = dst_kv_ptrs[decode_layer_start:decode_layer_end]
             kv_item_len = self.kv_args.kv_item_lens[0]
             layers_params = [
                 (
                     src_kv_ptrs[layer_id],
-                    dst_kv_ptrs[layer_id],
+                    dst_kv_ptrs[layer_id - prefill_layer_start],
                     kv_item_len,
                 )
-                for layer_id in range(layers_per_pp_stage)
+                for layer_id in range(prefill_layer_start, prefill_layer_end)
             ]
         else:
             num_kv_layers = len(self.kv_args.kv_data_ptrs) // 2
             dst_num_total_layers = num_kv_layers * self.pp_size
             src_k_ptrs = self.kv_args.kv_data_ptrs[:num_kv_layers]
             src_v_ptrs = self.kv_args.kv_data_ptrs[num_kv_layers:]
-            layers_per_pp_stage = len(src_k_ptrs)
-            dst_k_ptrs = dst_kv_ptrs[start_layer:end_layer]
+            dst_k_ptrs = dst_kv_ptrs[decode_layer_start:decode_layer_end]
             dst_v_ptrs = dst_kv_ptrs[
-                dst_num_total_layers + start_layer : dst_num_total_layers + end_layer
+                dst_num_total_layers + decode_layer_start : dst_num_total_layers + decode_layer_end
             ]
             kv_item_len = self.kv_args.kv_item_lens[0]
             layers_params = [
                 (
                     src_k_ptrs[layer_id],
-                    dst_k_ptrs[layer_id],
+                    dst_k_ptrs[layer_id - prefill_layer_start],
                     kv_item_len,
                 )
-                for layer_id in range(layers_per_pp_stage)
+                for layer_id in range(prefill_layer_start, prefill_layer_end)
             ] + [
                 (
                     src_v_ptrs[layer_id],
-                    dst_v_ptrs[layer_id],
+                    dst_v_ptrs[layer_id - prefill_layer_start],
                     kv_item_len,
                 )
-                for layer_id in range(layers_per_pp_stage)
+                for layer_id in range(prefill_layer_start, prefill_layer_end)
             ]
         assert layers_params is not None
 
@@ -641,6 +661,10 @@ class MooncakeKVManager(BaseKVManager):
                                 kv_chunk.prefill_kv_indices,
                                 target_rank_registration_info.dst_kv_ptrs,
                                 chunked_dst_kv_indice,
+                                req.prefill_layer_start,
+                                req.prefill_layer_end,
+                                req.decode_layer_start,
+                                req.decode_layer_end,
                                 executor,
                             )
                         else:
@@ -1167,7 +1191,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             )
             self.required_dst_info_num = 1
             self.required_prefill_response_num = 1 * (
-                self.prefill_pp_size // self.kv_mgr.pp_size
+                math.ceil(self.prefill_pp_size / self.kv_mgr.pp_size)
             )
             self.target_tp_ranks = [self.target_tp_rank]
         elif self.kv_mgr.attn_tp_size > self.prefill_attn_tp_size:
@@ -1182,7 +1206,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                 self.kv_mgr.attn_tp_size // self.prefill_attn_tp_size
             )
             self.required_prefill_response_num = 1 * (
-                self.prefill_pp_size // self.kv_mgr.pp_size
+                math.ceil(self.prefill_pp_size / self.kv_mgr.pp_size)
             )
             self.target_tp_ranks = [self.target_tp_rank]
         else:
@@ -1208,7 +1232,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
             self.required_dst_info_num = 1
             self.required_prefill_response_num = (
                 self.prefill_attn_tp_size // self.kv_mgr.attn_tp_size
-            ) * (self.prefill_pp_size // self.kv_mgr.pp_size)
+            ) * (math.ceil(self.prefill_pp_size / self.kv_mgr.pp_size))
 
         if self.data_parallel_rank is not None:
             logger.debug(f"Targeting DP rank: {self.data_parallel_rank}")
@@ -1224,10 +1248,17 @@ class MooncakeKVReceiver(BaseKVReceiver):
             f"{self.bootstrap_addr}_{self.target_dp_group}_{self.target_tp_rank}"
         )
 
+        # get prefill and decode kvcache transfer mapping dict under pp
+        # TODO(francis): use total_layer_num to replace hardcoded 61
+        self.kvcache_transfer_mapping = get_disagg_mapping_under_pp(
+            61, self.prefill_pp_size, self.kv_mgr.pp_size, self.kv_mgr.pp_rank
+        )
+
         if bootstrap_key not in self.kv_mgr.connection_pool:
             bootstrap_infos = []
             for target_tp_rank in self.target_tp_ranks:
-                for target_pp_rank in range(self.prefill_pp_size):
+                bootstrap_info_list = []
+                for target_pp_rank in self.kvcache_transfer_mapping.keys():
                     bootstrap_info = self._get_bootstrap_info_from_server(
                         target_tp_rank, self.target_dp_group, target_pp_rank
                     )
@@ -1244,7 +1275,12 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         logger.debug(
                             f"Fetched bootstrap info: {bootstrap_info} for DP {self.target_dp_group} TP {target_tp_rank} PP {target_pp_rank}"
                         )
-                        bootstrap_infos.append(bootstrap_info)
+                        # add layer range info to bootstrap_info
+                        bootstrap_info["prefill_layer_start"] = self.kvcache_transfer_mapping[target_pp_rank][0]
+                        bootstrap_info["prefill_layer_end"] = self.kvcache_transfer_mapping[target_pp_rank][1]
+                        bootstrap_info["decode_layer_start"] = self.kvcache_transfer_mapping[target_pp_rank][2]
+                        bootstrap_info["decode_layer_end"] = self.kvcache_transfer_mapping[target_pp_rank][3]
+                        bootstrap_info_list.append(bootstrap_info)
                     else:
                         self.kv_mgr.record_failure(
                             self.bootstrap_room,
@@ -1252,6 +1288,7 @@ class MooncakeKVReceiver(BaseKVReceiver):
                         )
                         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
                         return
+                bootstrap_infos.append(bootstrap_info_list)
 
             self.bootstrap_infos = bootstrap_infos
             self.kv_mgr.connection_pool[bootstrap_key] = self.bootstrap_infos
@@ -1308,35 +1345,36 @@ class MooncakeKVReceiver(BaseKVReceiver):
             return None, None, None
 
     def _register_kv_args(self):
-        for bootstrap_info in self.bootstrap_infos:
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-            # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
-            tp_rank = self.kv_mgr.kv_args.engine_rank
-            kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
-            dst_tp_rank = str(tp_rank).encode("ascii")
-            dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
-            dst_kv_item_len = str(kv_item_len).encode("ascii")
-
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            with lock:
-                sock.send_multipart(
-                    [
-                        "None".encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        packed_kv_data_ptrs,
-                        packed_aux_data_ptrs,
-                        dst_tp_rank,
-                        dst_attn_tp_size,
-                        dst_kv_item_len,
-                    ]
+        for bootstrap_info_list in self.bootstrap_infos:
+            for bootstrap_info in bootstrap_info_list:
+                packed_kv_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
                 )
+                packed_aux_data_ptrs = b"".join(
+                    struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+                )
+                # Note(shangming): No need to add pp rank here since pp is not supported on the decode side yet
+                tp_rank = self.kv_mgr.kv_args.engine_rank
+                kv_item_len = self.kv_mgr.kv_args.kv_item_lens[0]
+                dst_tp_rank = str(tp_rank).encode("ascii")
+                dst_attn_tp_size = str(self.kv_mgr.attn_tp_size).encode("ascii")
+                dst_kv_item_len = str(kv_item_len).encode("ascii")
+
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                with lock:
+                    sock.send_multipart(
+                        [
+                            "None".encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            packed_kv_data_ptrs,
+                            packed_aux_data_ptrs,
+                            dst_tp_rank,
+                            dst_attn_tp_size,
+                            dst_kv_item_len,
+                        ]
+                    )
 
     @classmethod
     def _connect(cls, endpoint: str, is_ipv6: bool = False):
@@ -1361,22 +1399,27 @@ class MooncakeKVReceiver(BaseKVReceiver):
         return sock, lock
 
     def init(self, kv_indices: npt.NDArray[np.int32], aux_index: Optional[int] = None):
-        for bootstrap_info in self.bootstrap_infos:
-            sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            is_dummy = bootstrap_info["is_dummy"]
+        for bootstrap_info_list in self.bootstrap_infos:
+            for bootstrap_info in bootstrap_info_list:
+                sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
+                is_dummy = bootstrap_info["is_dummy"]
 
-            with lock:
-                sock.send_multipart(
-                    [
-                        str(self.bootstrap_room).encode("ascii"),
-                        self.kv_mgr.local_ip.encode("ascii"),
-                        str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.session_id.encode("ascii"),
-                        kv_indices.tobytes() if not is_dummy else b"",
-                        str(aux_index).encode("ascii") if not is_dummy else b"",
-                        str(self.required_dst_info_num).encode("ascii"),
-                    ]
-                )
+                with lock:
+                    sock.send_multipart(
+                        [
+                            str(self.bootstrap_room).encode("ascii"),
+                            self.kv_mgr.local_ip.encode("ascii"),
+                            str(self.kv_mgr.rank_port).encode("ascii"),
+                            self.session_id.encode("ascii"),
+                            kv_indices.tobytes() if not is_dummy else b"",
+                            str(aux_index).encode("ascii") if not is_dummy else b"",
+                            str(self.required_dst_info_num).encode("ascii"),
+                            str(bootstrap_info["prefill_layer_start"]).encode("ascii"),
+                            str(bootstrap_info["prefill_layer_end"]).encode("ascii"),
+                            str(bootstrap_info["decode_layer_start"]).encode("ascii"),
+                            str(bootstrap_info["decode_layer_end"]).encode("ascii"),
+                        ]
+                    )
         self.init_time = time.time()
 
     def poll(self) -> KVPoll:

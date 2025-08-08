@@ -400,6 +400,8 @@ class Scheduler(
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
         self.last_batch: Optional[ScheduleBatch] = None
+        # used for pp, transferred reqs
+        self.transferred_reqs: List[Req] = []
         self.forward_ct = 0
         self.forward_ct_decode = 0
         self.num_generated_tokens = 0
@@ -2569,7 +2571,10 @@ def run_scheduler_process(
             if scheduler.enable_overlap:
                 scheduler.event_loop_overlap_disagg_decode()
             else:
-                scheduler.event_loop_normal_disagg_decode()
+                if server_args.pp_size > 1:
+                    scheduler.event_loop_normal_pp_disagg_decode()
+                else:
+                    scheduler.event_loop_normal_disagg_decode()
 
     except Exception:
         traceback = get_exception_traceback()

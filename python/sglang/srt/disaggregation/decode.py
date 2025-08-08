@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import torch
 from torch.distributed import ProcessGroup
-
+ 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import BaseKVManager, BaseKVReceiver, KVPoll
 from sglang.srt.disaggregation.utils import (
@@ -45,19 +45,20 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import KVCache, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils import require_mlp_sync
+from sglang.srt.utils import require_mlp_sync, point_to_point_pyobj, broadcast_pyobj
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
-    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler import Scheduler, GenerationBatchResult
 
 
 class DecodeReqToTokenPool:
@@ -864,7 +865,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         return new_batch
 
-    def process_decode_queue(self: Scheduler):
+    def process_decode_queue(self: Scheduler, add_to_waiting_queue: bool = True):
         # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
         resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs()
         self.waiting_queue.extend(resumed_reqs)
@@ -877,4 +878,309 @@ class SchedulerDisaggregationDecodeMixin:
         alloc_reqs = (
             self.disagg_decode_transfer_queue.pop_transferred()
         )  # the requests which kv has arrived
-        self.waiting_queue.extend(alloc_reqs)
+        if add_to_waiting_queue:
+            self.waiting_queue.extend(alloc_reqs)
+        else:
+            self.transferred_reqs.extend(alloc_reqs)
+    
+    @torch.no_grad()
+    def event_loop_normal_pp_disagg_decode(self: Scheduler) -> None:
+        """A normal pp scheduler loop for decode worker in disaggregation mode."""
+        mbs = [None] * self.pp_size
+        last_mbs = [None] * self.pp_size
+        self.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(self.pp_size)
+        ]
+        bids = [None] * self.pp_size
+        pp_outputs: Optional[PPProxyTensors] = None
+
+        # the key point of this loop is to sync kvcache transfer status between pp stages
+        # synchronize has two steps:
+        #     1. synchronize within attn tp ranks
+        #     2. synchronize between pp ranks
+        #       2.1 send transfered rids to next pp stage, just like 'pp_outputs'
+        #       2.2 we do not use dist operation to avoid hang, since there has been so many sync operations in the loop
+        #
+        # the flow of req is :
+        #     1. recv_reqs -> prealloc_queue and pending_rids -> transfered_queue -> ready_rids -> waiting_queue
+
+        # request ids that is received but not scheduled
+        pending_rids = []
+
+        # ready to roll requests' ids, received from previous pp stage
+        ready_rids = []
+
+        first_rank_recv_step = 0
+        while True:
+            server_is_idle = True
+            for mb_id in range(self.pp_size):
+                # whether get a result from run_batch or not
+                #   1. if set, need to send pp_hidden_states_proxy_tensors to next stage
+                #   2. if not set, indicates the first arrival of a batch, only need to stream output
+                result_set = False
+
+                # whether the current batch is ready to send to next stage
+                # in pp, the first rank always decide whether a batch is ready to run
+                ready_to_send_to_next_stage = False
+
+                # transfered rids that synced with previous pp stage
+                synced_transfered_rids = []
+
+                self.running_batch = self.running_mbs[mb_id]
+                self.last_batch = last_mbs[mb_id]
+                recv_reqs = self.recv_requests()
+
+                # recv ready requests' ids from previous pp stage
+                if not self.pp_group.is_first_rank:
+                    # upstream_ready_rids = self.recv_ready_requests()
+                    upstream_ready_rids = self.recv_pyobj_from_prev_stage()
+                    ready_rids.extend(upstream_ready_rids)
+                    # put ready requests to waiting_queue and remove ready rids from pending_rids
+                    self.waiting_queue.extend([req for req in self.transfered_reqs if req.rid in ready_rids])
+                    pending_rids = [rid for rid in pending_rids if rid not in ready_rids]
+                    self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in ready_rids]
+                    ready_rids = []
+                
+                # recv transferred reqs from previous pp stage and 
+                # find common rids between transfered_rids and local_transfered_rids
+                if len(pending_rids) > 0 and not self.pp_group.is_first_rank:
+                    # transfered_rids = self.recv_transfer_rids()
+                    transfered_rids = self.recv_pyobj_from_prev_stage()
+                    local_transfered_rids = [req.rid for req in self.transfered_reqs]
+                    synced_transfered_rids = [rid for rid in transfered_rids if rid in local_transfered_rids]
+                
+                self.process_input_requests(recv_reqs)
+                self.process_decode_queue(add_to_waiting_queue=False)
+                
+                mbs[mb_id] = self.get_next_disagg_decode_batch_to_run()
+                last_mbs[mb_id] = None
+                self.running_mbs[mb_id] = self.running_batch
+                self.cur_batch = mbs[mb_id]
+
+                if self.cur_batch:
+                    server_is_idle = False
+                    # Generate fake extend output.
+                    if self.cur_batch.forward_mode.is_extend():
+                        self.stream_output(
+                            self.cur_batch.reqs, any(req.return_logprob for req in self.cur_batch.reqs)
+                        )
+                        ready_to_send_to_next_stage = True
+                        next_mb_id = (mb_id + 1) % self.pp_size
+                        last_mbs[next_mb_id] = self.cur_batch
+                        # set mbs[mb_id] to None to avoid next stage to receive the output, which should be delayed to next next stage
+                        mbs[mb_id] = None
+                        if require_mlp_sync(self.server_args):
+                            self._prepare_idle_batch_and_run(None)
+                    else:
+                        if require_mlp_sync(self.server_args):
+                            self.prepare_mlp_sync_batch(self.cur_batch)
+                        result = self.run_batch(self.cur_batch)
+                        result_set = True
+                elif require_mlp_sync(self.server_args):
+                    self.cur_batch, _ = self._prepare_idle_batch_and_run(None)
+                
+                # (last rank) send the outputs to the next step
+                if self.pp_group.is_last_rank:
+                    if self.cur_batch and result_set:
+                        next_token_ids, bids[mb_id] = (
+                            result.next_token_ids,
+                            result.bid,
+                        )
+                        if self.cur_batch.return_logprob:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                    "extend_input_len_per_req": result.extend_input_len_per_req,
+                                    "extend_logprob_start_len_per_req": result.extend_logprob_start_len_per_req,
+                                }
+                                | (
+                                    {
+                                        f"logits_output.{k}": v
+                                        for k, v in result.logits_output.__dict__.items()
+                                    }
+                                    if result.logits_output is not None
+                                    else {}
+                                )
+                            )
+                        else:
+                            pp_outputs = PPProxyTensors(
+                                {
+                                    "next_token_ids": next_token_ids,
+                                }
+                            )
+                        # send the output from the last round to let the next stage worker run post processing
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+                
+                # receive outputs and post-process (filter finished reqs) the coming microbatch
+                next_mb_id = (mb_id + 1) % self.pp_size
+                next_pp_outputs = None
+                if mbs[next_mb_id] is not None:
+                    next_pp_outputs: Optional[PPProxyTensors] = PPProxyTensors(
+                        self.pp_group.recv_tensor_dict(
+                            all_gather_group=self.attn_tp_group
+                        )
+                    )
+                    mbs[next_mb_id].output_ids = next_pp_outputs["next_token_ids"]
+                    logits_output_args = {
+                        k[len("logits_output.") :]: v
+                        for k, v in next_pp_outputs.tensors.items()
+                        if k.startswith("logits_output.")
+                    }
+                    if len(logits_output_args) > 0:
+                        logits_output = LogitsProcessorOutput(**logits_output_args)
+                    else:
+                        logits_output = None
+                    output_result = GenerationBatchResult(
+                        logits_output=logits_output,
+                        pp_hidden_states_proxy_tensors=None,
+                        next_token_ids=next_pp_outputs["next_token_ids"],
+                        extend_input_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_input_len_per_req", None
+                        ),
+                        extend_logprob_start_len_per_req=next_pp_outputs.tensors.get(
+                            "extend_logprob_start_len_per_req", None
+                        ),
+                        bid=bids[next_mb_id],
+                        can_run_cuda_graph=result.can_run_cuda_graph if result_set else False,
+                    )
+                    self.process_batch_result(mbs[next_mb_id], output_result)
+
+                # (not last rank)
+                if not self.pp_group.is_last_rank:
+                    if self.cur_batch and result_set:
+                        bids[mb_id] = result.bid
+                    # carry the outputs to the next stage
+                    # send the outputs from the last round to let the next stage worker run post processing
+                    if pp_outputs:
+                        self.pp_group.send_tensor_dict(
+                            pp_outputs.tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                    # recv trans rids here
+                    if len(pending_rids) > 0 and self.pp_group.is_first_rank:
+                        if first_rank_recv_step >= self.pp_size -1:
+                            # transfer_rids = self.recv_transfer_rids()
+                            transfer_rids = self.recv_pyobj_from_prev_stage()
+                            local_transfered_rids = [req.rid for req in self.transfered_reqs]
+                            # find common rids between transfer_rids and local_transfered_rids
+                            synced_transfered_rids = [rid for rid in transfer_rids if rid in local_transfered_rids]
+
+                            # TODO: delay 2 steps
+                            ready_reqs = []
+                            for req in self.transfered_reqs:
+                                if req.rid in synced_transfered_rids:
+                                    ready_reqs.append(req)
+                            self.waiting_queue.extend(ready_reqs)
+                            self.transfered_reqs = [req for req in self.transfered_reqs if req.rid not in synced_transfered_rids]
+                            ready_rids = []
+                        else:
+                            first_rank_recv_step += 1
+                    else:
+                        first_rank_recv_step = 0
+
+
+                    rids_to_send = []
+                    if self.cur_batch is not None and ready_to_send_to_next_stage:
+                        for req in self.cur_batch.reqs:
+                            if hasattr(req, "rid"):
+                                rids_to_send.append(req.rid)
+                    if self.attn_tp_rank == 0:
+                        # send out reqs to the next stage
+                        dp_offset = self.attn_dp_rank * self.attn_tp_size
+                        point_to_point_pyobj(
+                            recv_reqs,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+
+                        # add send transfered reqs to sync with next pp stage
+                        point_to_point_pyobj(
+                            rids_to_send,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            self.world_group.cpu_group,
+                            self.pp_rank * self.tp_size + dp_offset,
+                            (self.pp_rank + 1) * self.tp_size + dp_offset,
+                        )
+                    for rid in rids_to_send:
+                        pending_rids.remove(rid)
+                    if len(pending_rids) == 0:
+                        first_rank_recv_step = 0
+                        # send transfered reqs' rid to next stage and finally gather in the first rank
+
+                if len(pending_rids) > 0 and self.attn_tp_rank == 0:
+                    if self.pp_group.is_first_rank:
+                        transfer_rids = [req.rid for req in self.transfered_reqs]
+                    else:
+                        transfer_rids = synced_transfered_rids
+                    dp_offset = self.attn_dp_rank * self.attn_tp_size
+                    point_to_point_pyobj(
+                        transfer_rids,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        self.world_group.cpu_group,
+                        self.pp_rank * self.tp_size + dp_offset,
+                        ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+                    )
+                
+                for req in recv_reqs:
+                    if hasattr(req, "rid"):
+                        pending_rids.append(req.rid)
+                        
+                if not self.pp_group.is_last_rank:
+                    # send out proxy tensors to the next stage
+                    if self.cur_batch and result_set:
+                        self.pp_group.send_tensor_dict(
+                            result.pp_hidden_states_proxy_tensors,
+                            all_gather_group=self.attn_tp_group,
+                        )
+
+                pp_outputs = next_pp_outputs
+
+            # When the server is idle, self-check and re-init some states
+            # check if member of mbs is all None
+            if server_is_idle and (
+                len(self.waiting_queue)
+                + len(self.disagg_decode_transfer_queue.queue)
+                + len(self.disagg_decode_prealloc_queue.queue)
+                + len(self.transfered_reqs)
+                == 0
+            ):
+                self.check_memory()
+                self.new_token_ratio = self.init_new_token_ratio
+                self.maybe_sleep_on_idle()
+            self.running_batch.batch_is_full = False
+
+    def send_pyobj_to_next_stage(self, data):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            point_to_point_pyobj(
+                data,
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                self.pp_rank * self.tp_size + dp_offset,
+                ((self.pp_rank + 1) % self.pp_size) * self.tp_size + dp_offset,
+            )
+
+    def recv_pyobj_from_prev_stage(self):
+        if self.attn_tp_rank == 0:
+            dp_offset = self.attn_dp_rank * self.attn_tp_size
+            data = point_to_point_pyobj(
+                [],
+                self.pp_rank * self.tp_size + dp_offset,
+                self.world_group.device_group,
+                ((self.pp_rank - 1) % self.pp_size) * self.tp_size + dp_offset,
+                self.pp_rank * self.tp_size + dp_offset,
+            )
+        else:
+            data = None
+
+        if self.tp_size != 1:
+            data = broadcast_pyobj(
+                data, self.tp_group.rank, self.tp_cpu_group, src=self.tp_group.ranks[0]
+            )
+        return data

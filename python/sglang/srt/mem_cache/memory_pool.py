@@ -732,6 +732,7 @@ class MLATokenToKVPool(KVCache):
 
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
+        # used for pp
 
         # for disagg with nvlink
         self.enable_custom_mem_pool = get_bool_env_var(

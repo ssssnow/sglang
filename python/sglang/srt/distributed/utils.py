@@ -92,6 +92,93 @@ def get_pp_indices(
 
     return (start_layer, end_layer)
 
+def get_disagg_mapping_under_pp(num_layers: int, prefill_pp_size: int, decode_pp_size: int, decode_pp_rank: int) -> Dict[int, Tuple[int, int, int, int]]:
+    """
+    Calculate the transfer mapping relationship for a specific decode pp rank
+    
+    Args:
+        num_layers: Total number of model layers
+        prefill_pp_size: Number of nodes in the first group (pipeline parallel size)
+        decode_pp_size: Number of nodes in the second group (pipeline parallel size)
+        decode_pp_rank: The specific decode pp rank to calculate mapping for
+    
+    Returns:
+        dict: Transfer mapping relationship for the specified decode pp rank, format as
+              {source_node_id: (source_start, source_end, target_start, target_end)}
+              where:
+              - source_start, source_end: layer indices in the source node
+              - target_start, target_end: layer indices in the current decode node
+    
+    Example:
+        >>> get_disagg_mapping_under_pp(61, 4, 2, 0)
+        {0: (0, 15, 0, 15), 1: (0, 15, 15, 30)}
+        >>> get_disagg_mapping_under_pp(61, 4, 2, 1)
+        {2: (0, 15, 0, 15), 3: (0, 16, 15, 31)}
+    """
+    if prefill_pp_size <= 0 or decode_pp_size <= 0 or num_layers <= 0:
+        raise ValueError("prefill_pp_size, decode_pp_size, num_layers must be positive integers")
+    
+    if decode_pp_rank < 0 or decode_pp_rank >= decode_pp_size:
+        raise ValueError(f"decode_pp_rank must be between 0 and {decode_pp_size-1}")
+    
+    # Calculate layer distribution for each node
+    layers_per_node_first = num_layers // prefill_pp_size
+    layers_per_node_second = num_layers // decode_pp_size
+    
+    # Calculate layer range for the specified second group node
+    start_layer_second = decode_pp_rank * layers_per_node_second
+    end_layer_second = start_layer_second + layers_per_node_second
+    if decode_pp_rank == decode_pp_size - 1:
+        end_layer_second = num_layers
+    
+    # Calculate corresponding first group node range
+    source_node_indices = {}
+    target_layer_counter = 0  # Counter for layers in current decode node
+    
+    for layer in range(start_layer_second, end_layer_second):
+        # Directly calculate which node in the first group the layer belongs to
+        first_node_id = layer // layers_per_node_first
+        if first_node_id >= prefill_pp_size:
+            first_node_id = prefill_pp_size - 1  # Last layer assigned to the last node
+        
+        # Calculate relative position of layer in the first group node
+        layer_index_in_first_node = layer % layers_per_node_first
+        if first_node_id == prefill_pp_size - 1 and layer >= prefill_pp_size * layers_per_node_first:
+            # For the last node, the part beyond the base number of layers
+            layer_index_in_first_node = layer - prefill_pp_size * layers_per_node_first + layers_per_node_first
+        
+        # Update index range for source node
+        if first_node_id not in source_node_indices:
+            source_node_indices[first_node_id] = {
+                'source_start': layer_index_in_first_node,
+                'source_end': layer_index_in_first_node + 1,
+                'target_start': target_layer_counter,
+                'target_end': target_layer_counter + 1
+            }
+        else:
+            source_node_indices[first_node_id]['source_start'] = min(
+                source_node_indices[first_node_id]['source_start'], 
+                layer_index_in_first_node
+            )
+            source_node_indices[first_node_id]['source_end'] = max(
+                source_node_indices[first_node_id]['source_end'], 
+                layer_index_in_first_node + 1
+            )
+            source_node_indices[first_node_id]['target_end'] = target_layer_counter + 1
+        
+        target_layer_counter += 1
+    
+    # Convert to final format
+    transfer_mapping = {}
+    for first_node_id, indices in source_node_indices.items():
+        transfer_mapping[first_node_id] = (
+            indices['source_start'], 
+            indices['source_end'],
+            indices['target_start'],
+            indices['target_end']
+        )
+    
+    return transfer_mapping
 
 @dataclasses.dataclass
 class StatelessProcessGroup:
