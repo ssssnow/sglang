@@ -150,7 +150,6 @@ class MooncakeKVManager(BaseKVManager):
         self.local_ip = get_local_ip_auto()
         self.is_mla_backend = is_mla_backend
         self.disaggregation_mode = disaggregation_mode
-        self.init_engine()
         # for p/d multi node infer
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
@@ -171,6 +170,8 @@ class MooncakeKVManager(BaseKVManager):
         self.server_socket = zmq.Context().socket(zmq.PULL)
         if is_valid_ipv6_address(self.local_ip):
             self.server_socket.setsockopt(zmq.IPV6, 1)
+
+        self.init_engine()
 
         self.register_buffer_to_engine()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -252,10 +253,21 @@ class MooncakeKVManager(BaseKVManager):
         self.failure_lock = threading.Lock()
 
     def init_engine(self):
+        # tmp modify for better transfer performance
+        ib_device_list = self.kv_args.ib_device.split(",") if self.kv_args.ib_device is not None else []
+        num_ib_devices = len(ib_device_list)
+        best_topo_ib_device = self.kv_args.ib_device
+        # currently, 2 is the best topo for 8 ib devices
+        num_shared_ib_devices = 2
+        if num_ib_devices >= num_shared_ib_devices:
+            engine_rank = (self.attn_dp_rank * self.attn_tp_size + self.attn_tp_rank) % num_ib_devices
+            best_topo_ib_device = f"{ib_device_list[2 * (engine_rank // num_shared_ib_devices)]}," \
+                                 f"{ib_device_list[2 * (engine_rank // num_shared_ib_devices) + 1]}"
         self.engine = MooncakeTransferEngine(
             hostname=self.local_ip,
             gpu_id=self.kv_args.gpu_id,
-            ib_device=self.kv_args.ib_device,
+            # ib_device=self.kv_args.ib_device,
+            ib_device=best_topo_ib_device,
         )
 
     def register_buffer_to_engine(self):
@@ -356,33 +368,47 @@ class MooncakeKVManager(BaseKVManager):
             ]
         assert layers_params is not None
 
-        # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+        def set_transfer_blocks(src_ptr: int, dst_ptr: int, item_len: int) -> int:
             transfer_blocks = []
             for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
                 transfer_blocks.append((src_addr, dst_addr, length))
-
+            return transfer_blocks
+        
+        # Worker function for processing a single layer
+        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
+            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
-
-        futures = [
-            executor.submit(
-                process_layer,
-                src_ptr,
-                dst_ptr,
-                item_len,
-            )
-            for (src_ptr, dst_ptr, item_len) in layers_params
-        ]
-
-        for future in concurrent.futures.as_completed(futures):
-            status = future.result()
-            if status != 0:
-                for f in futures:
-                    f.cancel()
-                return status
+        
+        # Worker function for processing all layers in a batch
+        def process_layers(layers_params):
+            transfer_blocks = []
+            for src_ptr, dst_ptr, item_len in layers_params:
+                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+            return self._transfer_data(mooncake_session_id, transfer_blocks)
+        
+        if self.enable_custom_mem_pool:
+            futures = [
+                executor.submit(
+                    process_layer,
+                    src_ptr,
+                    dst_ptr,
+                    item_len,
+                )
+                for (src_ptr, dst_ptr, item_len) in layers_params
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                status = future.result()
+                if status != 0:
+                    for f in futures:
+                        f.cancel()
+                    return status
+        else:
+            # use batch transfer, so we pass all layers params to one thread
+            # compared to use multiple executors, this is more efficient
+            return process_layers(layers_params)
 
         return 0
 
