@@ -654,6 +654,28 @@ class HiCacheController:
         while not self.stop_event.is_set():
             try:
                 operation = self.prefetch_buffer.get(block=True, timeout=1)
+
+                req_id = operation.request_id
+                total_pages = len(operation.hash_value)
+                total_tokens = total_pages * self.page_size
+                
+                logger.info(
+                    f"[HiCache Prefetch IO] req_id={req_id}, 开始IO传输, "
+                    f"pages={total_pages}, tokens={total_tokens}, "
+                    f"backend={self.storage_backend_type}"
+                )
+                io_start_time = time.monotonic()
+                io_elapsed = time.monotonic() - io_start_time
+                completed_tokens = operation.completed_tokens
+                
+                logger.info(
+                    f"[HiCache Prefetch IO] req_id={req_id}, IO传输完成, "
+                    f"完成tokens={completed_tokens}/{total_tokens}, "
+                    f"完成率={completed_tokens/total_tokens*100:.2f}%, "
+                    f"IO耗时={io_elapsed*1000:.2f}ms, "
+                    f"吞吐量={completed_tokens/io_elapsed:.2f}tokens/s"
+                )
+
                 self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
@@ -817,6 +839,13 @@ class HiCacheController:
 
                 if not self.backup_skip:
                     self._page_backup(operation)
+
+                num_tokens = len(operation.host_indices)
+                logger.info(
+                    f"[CacheController BackupThread] Host->Storage backup COMPLETED: "
+                    f"operation_id={operation.id}, completed_tokens={operation.completed_tokens}, "
+                    f"total_tokens={num_tokens}, success_rate={operation.completed_tokens/num_tokens*100:.1f}%"
+                )
                 self.ack_backup_queue.put(operation)
 
             except Empty:

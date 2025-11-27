@@ -241,6 +241,9 @@ class HiRadixCache(RadixCache):
         )
         self.ongoing_backup[operation_id] = node
         node.protect_host()
+        logger.info(
+            f"[HiCache WriteStorage] time: {time.time()}, Host->Storage write queued with operation_id={operation_id} for node_id={node.id}"
+        )
 
     def _inc_hit_count(self, node: TreeNode, chunked=False):
         # skip the hit count update for chunked requests
@@ -624,7 +627,7 @@ class HiRadixCache(RadixCache):
         completed_tokens, hash_value = self.cache_controller.terminate_prefetch(
             operation
         )
-        logger.debug(f"Prefetch {req_id} completed with {completed_tokens} tokens")
+        logger.info(f"Prefetch {req_id} completed with {completed_tokens} tokens")
 
         min_completed_tokens = completed_tokens
         if self.tp_world_size > 1:
