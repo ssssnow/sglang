@@ -252,6 +252,9 @@ class HiRadixCache(RadixCache):
             if node.hit_count >= self.write_through_threshold:
                 # write to host if the node is not backuped
                 self.write_backup(node)
+                # write to storage immediately
+                if self.enable_storage:
+                    self.write_backup_storage(node)
 
     def writing_check(self, write_back=False):
         if write_back:
@@ -290,8 +293,8 @@ class HiRadixCache(RadixCache):
             for ack_id in ack_list:
                 backuped_node = self.ongoing_write_through.pop(ack_id)
                 self.dec_lock_ref(backuped_node)
-                if self.enable_storage:
-                    self.write_backup_storage(backuped_node)
+                # if self.enable_storage:
+                #     self.write_backup_storage(backuped_node)
             finish_count -= 1
 
     def loading_check(self):
