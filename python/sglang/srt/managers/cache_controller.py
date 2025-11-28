@@ -665,9 +665,11 @@ class HiCacheController:
                     f"backend={self.storage_backend_type}"
                 )
                 io_start_time = time.monotonic()
+
+                self._page_transfer(operation)
+
                 io_elapsed = time.monotonic() - io_start_time
                 completed_tokens = operation.completed_tokens
-                
                 logger.info(
                     f"[HiCache Prefetch IO] req_id={req_id}, IO传输完成, "
                     f"完成tokens={completed_tokens}/{total_tokens}, "
@@ -676,7 +678,6 @@ class HiCacheController:
                     f"吞吐量={completed_tokens/io_elapsed:.2f}tokens/s"
                 )
 
-                self._page_transfer(operation)
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
                     operation.host_indices[operation.completed_tokens :]
@@ -751,11 +752,12 @@ class HiCacheController:
                     )
                     storage_hit_count = storage_hit_count_tensor.item()
 
+                logger.info(f"storage_hit_count: {storage_hit_count}, prefetch_threshold: {self.prefetch_threshold}")
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits
                     self.prefetch_revoke_queue.put(operation.request_id)
                     self.append_host_mem_release(operation.host_indices)
-                    logger.debug(
+                    logger.info(
                         f"Revoking prefetch for request {operation.request_id} due to insufficient hits ({storage_hit_count})."
                     )
                 else:
