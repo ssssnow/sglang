@@ -315,17 +315,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 openai_compatible_messages = openai_compatible_messages[:-1]
 
         try:
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            # DEBUG: 先获取 apply chat template 后的字符串（不 tokenize），然后打印
+            prompt_str = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
-                return_dict=False,
             )
+            # 后处理：去掉末尾的 <|im_end|>\n<|im_start|>assistant\n
+            suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
+            if prompt_str.endswith(suffix_to_remove):
+                prompt_str = prompt_str[:-len(suffix_to_remove)]
+            logger.info(f"[DEBUG] Before tokenize (jinja template) - prompt_str: {prompt_str}")
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
         except Exception:
             # This except branch will be triggered when the chosen model
             # has a different tools input format that is not compatible
@@ -335,17 +341,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 if tools
                 else None
             )
-            prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
+            # DEBUG: 先获取 apply chat template 后的字符串（不 tokenize），然后打印
+            prompt_str = self.tokenizer_manager.tokenizer.apply_chat_template(
                 openai_compatible_messages,
-                tokenize=True,
+                tokenize=False,
                 add_generation_prompt=True,
                 tools=tools,
                 reasoning_effort=request.reasoning_effort,
                 **(
                     request.chat_template_kwargs if request.chat_template_kwargs else {}
                 ),
-                return_dict=False,
             )
+            # 后处理：去掉末尾的 <|im_end|>\n<|im_start|>assistant\n
+            suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
+            if prompt_str.endswith(suffix_to_remove):
+                prompt_str = prompt_str[:-len(suffix_to_remove)]
+            logger.info(f"[DEBUG] Before tokenize (jinja template, fallback) - prompt_str: {prompt_str}")
+            prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
@@ -421,6 +433,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 stop.extend(request.stop)
 
         if not is_multimodal:
+            # DEBUG: 打印 apply chat template 后、tokenize 前的 input
+            logger.info(f"[DEBUG] Before tokenize (conversation template) - prompt: {prompt}")
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
 
         return MessageProcessingResult(
@@ -607,6 +621,8 @@ class OpenAIServingChat(OpenAIServingBase):
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
+                # DEBUG: 打印 detokenize 之后的完整输出（流式）
+                logger.info(f"[DEBUG] After detokenize (streaming) - output text: {stream_buffers.get(idx, '')}")
                 finish_reason_type = finish_reason_data["type"]
 
                 # Change finish_reason to "tool_calls" if we had tool calls and stopped naturally
@@ -730,6 +746,9 @@ class OpenAIServingChat(OpenAIServingBase):
 
             finish_reason = ret_item["meta_info"]["finish_reason"]
             text = ret_item["text"]
+            
+            # DEBUG: 打印 detokenize 之后的输出
+            logger.info(f"[DEBUG] After detokenize - output text: {text}")
 
             # Handle reasoning content
             reasoning_text = None
