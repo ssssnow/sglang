@@ -1587,6 +1587,25 @@ class Scheduler(
         # Process each request in the batch
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
+    
+    def prepare_single_disaggregated_decode_batch(self, new_batch: ScheduleBatch):
+        if new_batch is None:
+            return None
+
+        # set the last input token of each request as the first output token
+        last_input_tokens = []
+        for req in new_batch.reqs:
+            if req.origin_input_ids and len(req.output_ids) == 0:
+                last_input_token = req.origin_input_ids[-1]
+                req.output_ids.append(last_input_token)
+                last_input_tokens.append(last_input_token)
+
+        if last_input_tokens:
+            new_batch.output_ids = torch.tensor(
+                last_input_tokens, dtype=torch.int64, device=new_batch.device
+            )
+        
+        return new_batch
 
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         # Merge the prefill batch into the running batch
@@ -1627,6 +1646,17 @@ class Scheduler(
                     self.running_batch.merge_batch(self.last_batch)
 
         new_batch = self.get_new_batch_prefill()
+
+        if os.getenv("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
+            # skip prefill step, since kvcache and output tokens are already set
+            new_batch = self.prepare_single_disaggregated_decode_batch(new_batch)
+            if new_batch is not None:
+                if self.running_batch.is_empty():
+                    self.running_batch = new_batch
+                else:
+                    self.running_batch.merge_batch(new_batch)
+                # Set new_batch to None to skip prefill and go directly to decode
+                new_batch = None
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
