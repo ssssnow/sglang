@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import os
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
@@ -327,9 +328,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
             # 后处理：去掉末尾的 <|im_end|>\n<|im_start|>assistant\n
-            suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
-            if prompt_str.endswith(suffix_to_remove):
-                prompt_str = prompt_str[:-len(suffix_to_remove)]
+            if os.environ.get("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
+                suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
+                if prompt_str.endswith(suffix_to_remove):
+                    prompt_str = prompt_str[:-len(suffix_to_remove)]
             logger.info(f"[DEBUG] Before tokenize (jinja template) - prompt_str: {prompt_str}")
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
         except Exception:
@@ -353,17 +355,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 ),
             )
             # 后处理：去掉末尾的 <|im_end|>\n<|im_start|>assistant\n
-            suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
-            if prompt_str.endswith(suffix_to_remove):
-                prompt_str = prompt_str[:-len(suffix_to_remove)]
+            if os.environ.get("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
+                suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
+                if prompt_str.endswith(suffix_to_remove):
+                    prompt_str = prompt_str[:-len(suffix_to_remove)]
             logger.info(f"[DEBUG] Before tokenize (jinja template, fallback) - prompt_str: {prompt_str}")
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
+        logger.info(f"[DEBUG] After tokenize (jinja template, fallback) - prompt_ids: {prompt_ids}")
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
                 encoded = encoded[1:]
             prompt_ids += encoded
+        logger.info(f"[DEBUG] After assistant prefix (jinja template, fallback) - prompt_ids: {prompt_ids}")
 
         if is_multimodal:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)

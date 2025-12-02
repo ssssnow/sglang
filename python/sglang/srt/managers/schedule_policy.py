@@ -598,6 +598,9 @@ class PrefillAdder:
             # self.rem_total_tokens may decrease after the lock acquisition
             if total_tokens >= self.rem_total_tokens:
                 return AddReqResult.NO_TOKEN
+            
+            print(f"host_hit_length: {req.host_hit_length}, len of fill_ids: {len(req.fill_ids)}, len of prefix_indices: {prefix_len}")
+            print(f"extend_input_len: {req.extend_input_len}")
 
             if req.host_hit_length > 0:
                 new_indices, req.last_node = self.tree_cache.init_load_back(
@@ -607,6 +610,10 @@ class PrefillAdder:
                 req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
                 prefix_len = len(req.prefix_indices)
                 req.cache_protected_len = prefix_len
+
+            print("after init_load_back")
+            print(f"host_hit_length: {req.host_hit_length}, len of fill_ids: {len(req.fill_ids)}, len of prefix_indices: {prefix_len}")
+            print(f"extend_input_len: {req.extend_input_len}")
 
             input_tokens = self.ceil_paged_tokens(req.extend_input_len)
 
@@ -629,6 +636,9 @@ class PrefillAdder:
                         CLIP_MAX_NEW_TOKENS,
                     ),
                 )
+                print("after update_prefill_budget")
+                print(f"input_tokens: {input_tokens}, len of fill_ids: {len(req.fill_ids)}, len of prefix_indices: {prefix_len}")
+                print(f"extend_input_len: {req.extend_input_len}")
             else:
                 # Make sure at least one page is available
                 trunc_len = self.rem_chunk_tokens // self.page_size * self.page_size

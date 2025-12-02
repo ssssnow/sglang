@@ -790,6 +790,11 @@ class HiCacheController:
         operation = StorageOperation(
             host_indices, token_ids, hash_value=hash_value, prefix_keys=prefix_keys
         )
+        if isinstance(token_ids, list):
+            list_token_ids = token_ids
+        else:
+            list_token_ids = token_ids.token_ids
+        logger.info(f"[CacheController WriteStorage] operation_id={operation.id}, host_indices={host_indices}, token_ids={list_token_ids}, hash_value={hash_value}, prefix_keys={prefix_keys}")
         self.backup_queue.put(operation)
         return operation.id
 

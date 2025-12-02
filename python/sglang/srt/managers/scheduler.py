@@ -1421,6 +1421,8 @@ class Scheduler(
                 # otherwise, the allocated GPU memory must be locked for integrity
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
+                logger.info(f"[DEBUG] matched_len: {matched_len}")
+                logger.info(f"[DEBUG] fill_ids: {req.fill_ids}")
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
@@ -1599,6 +1601,16 @@ class Scheduler(
                 last_input_token = req.origin_input_ids[-1]
                 req.output_ids.append(last_input_token)
                 last_input_tokens.append(last_input_token)
+                
+                # Update fill_ids to keep it in sync with output_ids
+                # make fill_ids as the origin_input_ids except the last token
+                # req.fill_ids = req.origin_input_ids[:-1]
+                
+                # Note: kv_committed_len and kv_allocated_len are already set correctly
+                # by prepare_for_extend() to len(origin_input_ids), which is the correct
+                # value since the KV cache for all input tokens should already exist.
+                # The last_input_token added to output_ids doesn't need additional KV cache
+                # because it's the last input token whose KV cache was computed during prefill.
 
         if last_input_tokens:
             new_batch.output_ids = torch.tensor(
@@ -1675,6 +1687,19 @@ class Scheduler(
             if not self.running_batch.is_empty():
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
+                # 这里打印 ret batch 中 所有 req 的所有信息
+                # if ret is not None:
+                #     for req in ret.reqs:
+                #         logger.info(f"[DEBUG] req.rid: {req.rid}, req.fill_ids: {req.fill_ids}, req.prefix_indices: {req.prefix_indices}, req.host_hit_length: {req.host_hit_length}")
+                #         logger.info(f"[DEBUG] req.origin_input_ids: {req.origin_input_ids}, req.output_ids: {req.output_ids}")
+                #         logger.info(f"[DEBUG] req.kv_committed_len: {req.kv_committed_len}, req.kv_allocated_len: {req.kv_allocated_len}")
+                #         logger.info(f"[DEBUG] req.cache_protected_len: {req.cache_protected_len}")
+                #         logger.info(f"[DEBUG] req.extend_input_len: {req.extend_input_len}")
+                #         logger.info(f"[DEBUG] req.last_node: {req.last_node}")
+                #         logger.info(f"[DEBUG] req.last_host_node: {req.last_host_node}")
+                #         logger.info(f"[DEBUG] req.last_node.backuped: {req.last_node.backuped}")
+                #         logger.info(f"[DEBUG] req.last_node.get_last_hash_value(): {req.last_node.get_last_hash_value()}")
+                #         logger.info(f"[DEBUG] req.last_node.get_prefix_hash_values(req.last_node.parent): {req.last_node.get_prefix_hash_values(req.last_node.parent)}")
             else:
                 ret = None
 
@@ -1785,6 +1810,11 @@ class Scheduler(
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
                     continue
+
+            # if os.getenv("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
+            #     if len(req.origin_input_ids) > 0:
+            #         req.output_ids = [req.origin_input_ids[-1]]
+            #         req.origin_input_ids = req.origin_input_ids[:-1]
 
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(

@@ -72,7 +72,7 @@ class HiRadixCache(RadixCache):
         ) = self._parse_storage_backend_extra_config(
             server_args.hicache_storage_backend_extra_config
         )
-        self.prefetch_threshold = prefetch_threshold
+        self.prefetch_threshold = 1
         self.prefetch_timeout_base = prefetch_timeout_base
         self.prefetch_timeout_per_page = (
             self.page_size / 1024 * prefetch_timeout_per_ki_token
@@ -430,6 +430,7 @@ class HiRadixCache(RadixCache):
 
         # load it all or not at all
         host_indices = torch.cat([n.host_value for n in nodes_to_load])
+        logger.info(f"[HiRadixCache LoadBack] host_indices={host_indices}, len(host_indices)={len(host_indices)}")
         if len(host_indices) < self.load_back_threshold or (
             len(host_indices) > mem_quota + delta if mem_quota is not None else False
         ):
