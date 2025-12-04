@@ -982,10 +982,19 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
 
         while True:
+            timing_start = time.perf_counter()
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            timing_end = time.perf_counter()
+            if recv_reqs is not None and len(recv_reqs) > 0:
+                logger.info(f"[DEBUG] Time taken for recv_requests: {timing_end - timing_start} seconds, timestamp: {timing_start}")
 
+            timing_start = time.perf_counter()
             batch = self.get_next_batch_to_run()
+            timing_end = time.perf_counter()
+            if batch is not None:
+                logger.info(f"[DEBUG] Time taken for get_next_batch_to_run: {timing_end - timing_start} seconds, timestamp: {timing_start}")
+
             self.cur_batch = batch
 
             disable_overlap_for_batch = (
@@ -1001,7 +1010,11 @@ class Scheduler(
 
             batch_result = None
             if batch:
+                timing_start = time.perf_counter()
                 batch_result = self.run_batch(batch)
+                timing_end = time.perf_counter()
+                if batch_result is not None:
+                    logger.info(f"[DEBUG] Time taken for run_batch: {timing_end - timing_start} seconds, timestamp: {timing_start}")
                 self.result_queue.append((batch.copy(), batch_result))
 
             if self.last_batch:
@@ -1421,8 +1434,8 @@ class Scheduler(
                 # otherwise, the allocated GPU memory must be locked for integrity
                 last_hash = req.last_host_node.get_last_hash_value()
                 matched_len = len(req.prefix_indices) + req.host_hit_length
-                logger.info(f"[DEBUG] matched_len: {matched_len}")
-                logger.info(f"[DEBUG] fill_ids: {req.fill_ids}")
+                # logger.info(f"[DEBUG] matched_len: {matched_len}")
+                # logger.info(f"[DEBUG] fill_ids: {req.fill_ids}")
                 new_input_tokens = req.fill_ids[matched_len:]
 
                 prefix_keys = (
@@ -1599,6 +1612,8 @@ class Scheduler(
         for req in new_batch.reqs:
             if req.origin_input_ids and len(req.output_ids) == 0:
                 last_input_token = req.origin_input_ids[-1]
+                # print(f"[DEBUG] origin_input_ids: {req.origin_input_ids}")
+                # logger.info(f"[DEBUG] last_input_token id: {last_input_token}")
                 req.output_ids.append(last_input_token)
                 last_input_tokens.append(last_input_token)
                 
@@ -1659,16 +1674,16 @@ class Scheduler(
 
         new_batch = self.get_new_batch_prefill()
 
-        if os.getenv("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
-            # skip prefill step, since kvcache and output tokens are already set
-            new_batch = self.prepare_single_disaggregated_decode_batch(new_batch)
-            if new_batch is not None:
-                if self.running_batch.is_empty():
-                    self.running_batch = new_batch
-                else:
-                    self.running_batch.merge_batch(new_batch)
-                # Set new_batch to None to skip prefill and go directly to decode
-                new_batch = None
+        # if os.getenv("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE") == "true":
+        #     # skip prefill step, since kvcache and output tokens are already set
+        #     new_batch = self.prepare_single_disaggregated_decode_batch(new_batch)
+        #     if new_batch is not None:
+        #         if self.running_batch.is_empty():
+        #             self.running_batch = new_batch
+        #         else:
+        #             self.running_batch.merge_batch(new_batch)
+        #         # Set new_batch to None to skip prefill and go directly to decode
+        #         new_batch = None
 
         need_mlp_sync = self.require_mlp_sync
         if need_mlp_sync and not self.spec_algorithm.is_none():
@@ -1884,10 +1899,13 @@ class Scheduler(
         )
         if self.enable_hierarchical_cache:
             # todo (zhiqiang): disable cuda graph execution if hicache loading triggered
+            # timing this function
+            timing_start = time.perf_counter()
             new_batch.hicache_consumer_index = (
                 self.tree_cache.ready_to_load_host_cache()
             )
-
+            timing_end = time.perf_counter()
+            logger.info(f"[DEBUG] Time taken for ready_to_load_host_cache: {timing_end - timing_start} seconds")
         new_batch.prepare_for_extend()
 
         # Mixed-style chunked prefill

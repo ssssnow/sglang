@@ -2218,6 +2218,7 @@ class ModelRunner:
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         ):
+            logger.info(f"[DEBUG] Running piecewise cuda graph for extend !!!!!!!!!!")
             return self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
 
         if not skip_attn_backend_init:
@@ -2337,11 +2338,16 @@ class ModelRunner:
                 forward_count=split_forward_count,
             )
         elif forward_batch.forward_mode.is_extend(include_draft_extend_v2=True):
+            timing_start = time.perf_counter()
             ret = self.forward_extend(
                 forward_batch,
                 skip_attn_backend_init=skip_attn_backend_init,
                 pp_proxy_tensors=pp_proxy_tensors,
             )
+            # sync the process
+            torch.cuda.synchronize()
+            timing_end = time.perf_counter()
+            logger.info(f"[DEBUG] Time taken for forward_extend: {timing_end - timing_start} seconds")
         elif forward_batch.forward_mode.is_idle():
             ret = self.forward_idle(forward_batch, pp_proxy_tensors=pp_proxy_tensors)
         else:

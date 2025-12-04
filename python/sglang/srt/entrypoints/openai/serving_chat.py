@@ -332,7 +332,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
                 if prompt_str.endswith(suffix_to_remove):
                     prompt_str = prompt_str[:-len(suffix_to_remove)]
-            logger.info(f"[DEBUG] Before tokenize (jinja template) - prompt_str: {prompt_str}")
+            # logger.info(f"[DEBUG] Before tokenize (jinja template) - prompt_str: {prompt_str}")
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
         except Exception:
             # This except branch will be triggered when the chosen model
@@ -359,16 +359,16 @@ class OpenAIServingChat(OpenAIServingBase):
                 suffix_to_remove = "<|im_end|>\n<|im_start|>assistant\n"
                 if prompt_str.endswith(suffix_to_remove):
                     prompt_str = prompt_str[:-len(suffix_to_remove)]
-            logger.info(f"[DEBUG] Before tokenize (jinja template, fallback) - prompt_str: {prompt_str}")
+            # logger.info(f"[DEBUG] Before tokenize (jinja template, fallback) - prompt_str: {prompt_str}")
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt_str)
-        logger.info(f"[DEBUG] After tokenize (jinja template, fallback) - prompt_ids: {prompt_ids}")
+        # logger.info(f"[DEBUG] After tokenize (jinja template, fallback) - prompt_ids: {prompt_ids}")
 
         if assistant_prefix:
             encoded = self.tokenizer_manager.tokenizer.encode(assistant_prefix)
             if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
                 encoded = encoded[1:]
             prompt_ids += encoded
-        logger.info(f"[DEBUG] After assistant prefix (jinja template, fallback) - prompt_ids: {prompt_ids}")
+        # logger.info(f"[DEBUG] After assistant prefix (jinja template, fallback) - prompt_ids: {prompt_ids}")
 
         if is_multimodal:
             prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
