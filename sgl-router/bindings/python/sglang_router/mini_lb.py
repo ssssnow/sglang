@@ -2,6 +2,7 @@
 Minimal HTTP load balancer for prefill and decode servers for testing.
 """
 
+import time
 import asyncio
 import ipaddress
 import logging
@@ -61,6 +62,7 @@ class MiniLoadBalancer:
         self.prefill_urls = [url[0] for url in router_args.prefill_urls]
         self.prefill_bootstrap_ports = [url[1] for url in router_args.prefill_urls]
         self.decode_urls = router_args.decode_urls
+        self.slow_decode_urls = router_args.slow_decode_urls
         self.otlp_traces_endpoint = router_args.otlp_traces_endpoint
         self.enable_trace = router_args.enable_trace
         if self.enable_trace and not trace_package_imported:
@@ -106,10 +108,25 @@ class MiniLoadBalancer:
             self.decode_urls[didx],
         )
 
+    def select_slow_pair(self):
+        assert len(self.prefill_urls) > 0, "No prefill servers available"
+        assert len(self.decode_urls) > 0, "No decode servers available"
+        pidx = random.randint(0, len(self.prefill_urls) - 1)
+        didx = random.randint(0, len(self.decode_urls) - 1)
+        sdidx = random.randint(0, len(self.slow_decode_urls) - 1)
+        return (
+            self.prefill_urls[pidx],
+            self.prefill_bootstrap_ports[pidx],
+            self.decode_urls[didx],
+            self.slow_decode_urls[sdidx],
+        )
+
     async def generate(
-        self, modified_request, prefill_server, decode_server, endpoint
+        self, modified_request, prefill_server, decode_server, slow_decode_server, endpoint
     ) -> ORJSONResponse:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        print(f"modified_request: {modified_request}, prefill_server: {prefill_server}, decode_server: {decode_server}, endpoint: {endpoint}")
 
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
@@ -127,6 +144,7 @@ class MiniLoadBalancer:
                 trace_context = trace_get_remote_propagate_context(bootstrap_room_list)
                 headers = {"trace_context": trace_context}
 
+            start_time = time.time()
             tasks = [
                 session.post(
                     f"{prefill_server}/{endpoint}",
@@ -160,6 +178,9 @@ class MiniLoadBalancer:
                         )
             else:
                 ret_json = await decode_response.json()
+
+            end_time = time.time()
+            print(f"time taken: {end_time - start_time}")
 
             for bootstrap_room in bootstrap_room_list:
                 trace_slice_end(
@@ -254,6 +275,180 @@ class MiniLoadBalancer:
                         AIOHTTP_STREAM_READ_CHUNK_SIZE
                     ):
                         yield chunk
+
+            for bootstrap_room in bootstrap_room_list:
+                trace_slice_end(
+                    "wait_PD_finish",
+                    bootstrap_room,
+                    thread_finish_flag=True,
+                )
+                trace_req_finish(bootstrap_room)
+
+        return StreamingResponse(
+            stream_results(),
+            media_type="text/event-stream",
+        )
+    
+    async def generate_custom_stream(
+        self, modified_request, prefill_server, decode_server, slow_decode_server, endpoint="generate"
+    ):
+        assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
+
+        async def stream_results():
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(
+                    total=self.timeout
+                )  # Add timeout for request reliability
+            ) as session:
+                # Create the tasks for both prefill and decode requests
+                headers = {}
+                bootstrap_room_list = []
+                if self.enable_trace:
+                    bootstrap_room_list = (
+                        modified_request["bootstrap_room"]
+                        if isinstance(modified_request["bootstrap_room"], list)
+                        else [modified_request["bootstrap_room"]]
+                    )
+                    trace_context = trace_get_remote_propagate_context(
+                        bootstrap_room_list
+                    )
+                    headers = {"trace_context": trace_context}
+
+                tasks = [
+                    session.post(
+                        f"{prefill_server}/{endpoint}",
+                        json=modified_request,
+                        headers=headers,
+                    ),
+                    session.post(
+                        f"{decode_server}/{endpoint}",
+                        json=modified_request,
+                        headers=headers,
+                    ),
+                ]
+
+                for bootstrap_room in bootstrap_room_list:
+                    trace_slice_end(
+                        "mini_lb_launch", bootstrap_room, auto_next_anon=True
+                    )
+                
+                # Start timing before sending requests
+                request_start_time = time.perf_counter()
+                
+                # Wait for both responses to complete. Since this is streaming, they return immediately.
+                prefill_response, decode_response = await asyncio.gather(*tasks)
+
+                if modified_request.get("return_logprob", False):
+                    prefill_chunks = []
+                    async for chunk in prefill_response.content:
+                        prefill_chunks.append(chunk)
+
+                    first_prefill_chunk = (
+                        prefill_chunks[0].decode("utf-8")[5:].strip("\n")
+                    )
+                    first_prefill_chunk_json = orjson.loads(first_prefill_chunk)
+
+                    async for chunk in decode_response.content:
+                        # Note: This is inefficient
+                        # merge prefill input_token_logprobs, output_token_logprobs to decode
+                        decoded_chunk = chunk.decode("utf-8")
+                        if (
+                            decoded_chunk
+                            and decoded_chunk.startswith("data:")
+                            and "[DONE]" not in decoded_chunk
+                        ):
+                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                            ret_json["meta_info"]["input_token_logprobs"] = (
+                                first_prefill_chunk_json["meta_info"][
+                                    "input_token_logprobs"
+                                ]
+                                + ret_json["meta_info"]["input_token_logprobs"]
+                            )
+
+                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                        else:
+                            yield chunk
+                else:
+                    first_chunk_received = False
+                    # 收集所有 content 用于后续发送到 slow_decode_server
+                    collected_content = []
+                    buffer = ""
+                    
+                    async for chunk in decode_response.content.iter_chunked(
+                        AIOHTTP_STREAM_READ_CHUNK_SIZE
+                    ):
+                        if not first_chunk_received:
+                            first_chunk_time = time.perf_counter()
+                            ttft = first_chunk_time - request_start_time
+                            print(f"[TTFT] Time to first chunk: {ttft * 1000:.2f} ms")
+                        first_chunk_received = True
+                        
+                        # 解析流式返回的 content 字段
+                        decoded_chunk = chunk.decode("utf-8")
+                        buffer += decoded_chunk
+                        
+                        # 按行处理 SSE 数据
+                        while "\n" in buffer:
+                            line, buffer = buffer.split("\n", 1)
+                            line = line.strip()
+                            if line.startswith("data:") and "[DONE]" not in line:
+                                try:
+                                    json_str = line[5:].strip()
+                                    if json_str:
+                                        chunk_json = orjson.loads(json_str)
+                                        # 提取 content 字段（流式响应使用 delta）
+                                        if "choices" in chunk_json and len(chunk_json["choices"]) > 0:
+                                            delta = chunk_json["choices"][0].get("delta", {})
+                                            content = delta.get("content")
+                                            if content:
+                                                collected_content.append(content)
+                                except Exception as e:
+                                    print(f"[generate_custom_stream] Error parsing chunk: {e}")
+                        
+                        yield chunk
+                    
+                    # 合并所有收集的 content
+                    assistant_content = "".join(collected_content)
+                    print(f"[generate_custom_stream] Collected assistant content length: {len(assistant_content)}")
+                    print(f"[generate_custom_stream] Assistant content: {assistant_content}")
+                    
+                    # 如果有 slow_decode_server，发送带有 assistant content 的请求
+                    if slow_decode_server is not None and assistant_content:
+                        print(f"[slow_decode] Sending request to slow_decode_server: {slow_decode_server}")
+                        
+                        # 创建新的请求，添加 assistant role 的消息
+                        slow_request = modified_request.copy()
+                        slow_request["max_tokens"] = 1024
+                        if "messages" in slow_request:
+                            # 复制 messages 列表以避免修改原始请求
+                            slow_request["messages"] = slow_request["messages"].copy()
+                            # 添加 assistant role 的消息
+                            slow_request["messages"].append({
+                                "role": "assistant",
+                                "content": assistant_content
+                            })
+                        
+                        # 发送请求到 slow_decode_server（流式）
+                        slow_request_start_time = time.perf_counter()
+                        slow_response = await session.post(
+                            f"{slow_decode_server}/{endpoint}",
+                            json=slow_request,
+                            headers=headers,
+                        )
+                        
+                        # 流式转发 slow_decode_server 的响应
+                        slow_first_chunk_received = False
+                        async for slow_chunk in slow_response.content.iter_chunked(
+                            AIOHTTP_STREAM_READ_CHUNK_SIZE
+                        ):
+                            if not slow_first_chunk_received:
+                                slow_first_chunk_time = time.perf_counter()
+                                slow_ttft = slow_first_chunk_time - slow_request_start_time
+                                print(f"[slow_decode TTFT] Time to first chunk: {slow_ttft * 1000:.2f} ms")
+                                slow_first_chunk_received = True
+                            yield slow_chunk
+                        
+                        print(f"[slow_decode] Response from slow_decode_server finished")
 
             for bootstrap_room in bootstrap_room_list:
                 trace_slice_end(
@@ -415,7 +610,12 @@ async def handle_generate_request(request_data: dict):
 
 
 async def _forward_to_backend(request_data: dict, endpoint_name: str):
-    prefill_server, bootstrap_port, decode_server = lb.select_pair()
+    print(f"slow_decode_urls: {lb.slow_decode_urls}")
+    use_slow_decode = len(lb.slow_decode_urls) > 0
+    if use_slow_decode:
+        prefill_server, bootstrap_port, decode_server, slow_decode_server = lb.select_slow_pair()
+    else:
+        prefill_server, bootstrap_port, decode_server = lb.select_pair()    # prefill_server, bootstrap_port, decode_server = lb.select_pair()
 
     # Parse and transform prefill_server for bootstrap data
     parsed_url = urllib.parse.urlparse(prefill_server)
@@ -430,10 +630,11 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
     )
 
     if request_data.get("stream", False):
-        return await lb.generate_stream(
+        return await lb.generate_custom_stream(
             modified_request,
             prefill_server,
             decode_server,
+            slow_decode_server if use_slow_decode else None,
             endpoint=endpoint_name,
         )
     else:
@@ -441,6 +642,7 @@ async def _forward_to_backend(request_data: dict, endpoint_name: str):
             modified_request,
             prefill_server,
             decode_server,
+            slow_decode_server if use_slow_decode else None,
             endpoint=endpoint_name,
         )
 

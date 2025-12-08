@@ -21,6 +21,7 @@ class RouterArgs:
         default_factory=list
     )  # List of (url, bootstrap_port)
     decode_urls: List[str] = dataclasses.field(default_factory=list)
+    slow_decode_urls: List[str] = dataclasses.field(default_factory=list)
 
     # Routing policy
     policy: str = "cache_aware"
@@ -204,6 +205,13 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        parser.add_argument(
+            f"--{prefix}slow-decode",
+            nargs=1,
+            action="append",
+            metavar=("URL",),
+            help="Slow decode server URL. Can be specified multiple times.",
         )
         parser.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
@@ -659,6 +667,9 @@ class RouterArgs:
         args_dict["decode_urls"] = cls._parse_decode_urls(
             cli_args_dict.get(f"{prefix}decode", None)
         )
+        args_dict["slow_decode_urls"] = cls._parse_slow_decode_urls(
+            cli_args_dict.get(f"{prefix}slow_decode", None)
+        )
         args_dict["selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}selector", None)
         )
@@ -761,3 +772,14 @@ class RouterArgs:
 
         # decode_list is a list of single-element lists due to nargs=1
         return [url[0] for url in decode_list]
+
+    @staticmethod
+    def _parse_slow_decode_urls(slow_decode_list):
+        """Parse slow decode URLs from --slow-decode arguments.
+
+        Format: --slow-decode URL
+        Example: --slow-decode http://slow-decode1:8082 --slow-decode http://slow-decode2:8082
+        """
+        if not slow_decode_list:
+            return []
+        return [url[0] for url in slow_decode_list]
