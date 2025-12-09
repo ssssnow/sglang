@@ -748,7 +748,7 @@ class HiCacheController:
                     start_time = time.perf_counter()
                     while True:
                         hash_value, storage_hit_count = self._storage_hit_query(operation)
-                        if storage_hit_count == len(operation.token_ids):
+                        if storage_hit_count >= len(operation.token_ids) - 1:
                             break
                         elapsed_ms = (time.perf_counter() - start_time) * 1000
                         if elapsed_ms >= timeout_ms:
@@ -864,7 +864,12 @@ class HiCacheController:
                     continue
 
                 if not self.backup_skip:
+                    # timing this
+                    start_time = time.perf_counter()
                     self._page_backup(operation)
+                    end_time = time.perf_counter()
+                    cost_ms = (end_time - start_time) * 1000
+                    logger.info(f"Backup cost : {cost_ms:.2f}ms for {operation.completed_tokens} tokens")
 
                 num_tokens = len(operation.host_indices)
                 logger.info(
