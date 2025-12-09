@@ -14,6 +14,7 @@ limitations under the License.
 """
 
 import logging
+import os
 import threading
 import time
 from queue import Empty, Full, Queue
@@ -670,13 +671,14 @@ class HiCacheController:
 
                 io_elapsed = time.monotonic() - io_start_time
                 completed_tokens = operation.completed_tokens
-                logger.info(
-                    f"[HiCache Prefetch IO] req_id={req_id}, IO传输完成, "
-                    f"完成tokens={completed_tokens}/{total_tokens}, "
-                    f"完成率={completed_tokens/total_tokens*100:.2f}%, "
-                    f"IO耗时={io_elapsed*1000:.2f}ms, "
-                    f"吞吐量={completed_tokens/io_elapsed:.2f}tokens/s"
-                )
+                if total_tokens > 0:
+                    logger.info(
+                        f"[HiCache Prefetch IO] req_id={req_id}, IO传输完成, "
+                        f"完成tokens={completed_tokens}/{total_tokens}, "
+                        f"完成率={completed_tokens/total_tokens*100:.2f}%, "
+                        f"IO耗时={io_elapsed*1000:.2f}ms, "
+                        f"吞吐量={completed_tokens/io_elapsed:.2f}tokens/s"
+                    )
 
                 # operation terminated by controller, release pre-allocated memory
                 self.append_host_mem_release(
@@ -725,6 +727,7 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        logger.info(f"len(tokens_to_fetch): {len(tokens_to_fetch)}, storage_query_count: {storage_query_count}")
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -740,7 +743,23 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                hash_value, storage_hit_count = self._storage_hit_query(operation)
+                if os.getenv("SGLANG_ENABLE_SINGLE_DISAGGREGATED_DECODE", "false") == "true":
+                    timeout_ms = 5000
+                    start_time = time.perf_counter()
+                    while True:
+                        hash_value, storage_hit_count = self._storage_hit_query(operation)
+                        if storage_hit_count == len(operation.token_ids):
+                            break
+                        elapsed_ms = (time.perf_counter() - start_time) * 1000
+                        if elapsed_ms >= timeout_ms:
+                            logger.warning(f"Prefetch wait timeout after {elapsed_ms:.2f}ms, storage_hit_count={storage_hit_count}, threshold={self.prefetch_threshold}")
+                            break
+                        time.sleep(0.01)
+                    cost_ms = (time.perf_counter() - start_time) * 1000
+                    logger.info(f"Prefetch lookup cost : {cost_ms:.2f}ms")
+                else:
+                    hash_value, storage_hit_count = self._storage_hit_query(operation)
+
                 if self.tp_world_size > 1:
                     storage_hit_count_tensor = torch.tensor(
                         storage_hit_count, dtype=torch.int
