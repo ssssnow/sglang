@@ -1742,6 +1742,9 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        if self.enable_hierarchical_cache:
+            self.tree_cache.check_hicache_events()
+
         # Handle the cases where prefill is not allowed
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
@@ -1761,9 +1764,6 @@ class Scheduler(
         ):
             self.running_batch.batch_is_full = True
             return None
-
-        if self.enable_hierarchical_cache:
-            self.tree_cache.check_hicache_events()
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
